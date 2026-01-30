@@ -1,10 +1,10 @@
 """
-Here we implement a more complex epoch-driven update system.
+This is a more complex epoch-driven update implementation.
 
 Cycle:
 baseline phase → propose permutation → adaptation phase → evaluate → (accept/reject) → temperature controller update
 
-We run model training only in adaptation phases for full epochs.
+Model training is only done in adaptation phases for full epochs.
 Perm proposals are applied only during perm-phase.
 Temperature controller training / committing happens only after adaptation and only if the perm change is accepted.
 All decisions are based on validation loss averaged over a small evaluation window to reduce variance.
@@ -17,6 +17,7 @@ import random
 import math
 import matplotlib.pyplot as plt
 import pickle, os
+import json
 
 SEED = 42
 np.random.seed(SEED)
@@ -52,7 +53,6 @@ class LearnableFeaturePermute(tf.keras.layers.Layer):
             logP = logP - tf.reduce_logsumexp(logP, axis=0, keepdims=True)
         return tf.exp(logP)
         
-
     def call(self, x):
         # Sinkhorn permutation matrix P (F, F)
         P = self._sinkhorn(self.logits / self.temperature)
@@ -63,7 +63,6 @@ class LearnableFeaturePermute(tf.keras.layers.Layer):
         # Build output shape reliably: concat tensors (not Python lists)
         out_shape = tf.concat([tf.shape(x)[:-1], tf.constant([self.num_features], dtype=tf.int32)], axis=0)
         return tf.reshape(out, out_shape)
-
 
 class MetaController(tf.keras.Model):
     def __init__(self, a_max=0.2, dim=1):
@@ -81,7 +80,6 @@ class MetaController(tf.keras.Model):
         norm = self.norm(state)
         a = self.net(norm)
         return self.a_max * a
-
 
 @tf.keras.utils.register_keras_serializable(package="Custom")
 class LearnableQueryPooling(tf.keras.layers.Layer):
@@ -102,7 +100,6 @@ class LearnableQueryPooling(tf.keras.layers.Layer):
         context = tf.matmul(scores, x)              # (B, 1, D)
         return tf.squeeze(context, axis=1)          # (B, D)
 
-
 @tf.keras.utils.register_keras_serializable(package="Custom")
 class MultiHeadReadout(tf.keras.layers.Layer):
     def __init__(self, dim, num_heads=2):
@@ -115,7 +112,7 @@ class MultiHeadReadout(tf.keras.layers.Layer):
     def build(self, input_shape):
         # input_shape = (batch, time, dim)
         self.query = self.add_weight(
-            shape=(1, 1, self.dim),           # <-- FIXED: properly rank-3
+            shape=(1, 1, self.dim),
             initializer="glorot_uniform",
             trainable=True,
             name="readout_query"
@@ -131,7 +128,6 @@ class MultiHeadReadout(tf.keras.layers.Layer):
         out = self.mha(query=q, value=x, key=x)      # (B, 1, D)
         return tf.squeeze(out, axis=1)               # (B, D)   
         
-
 @tf.keras.utils.register_keras_serializable(package="Custom")
 class AdvancedGatedReadout(tf.keras.layers.Layer):
     def __init__(self, dim, num_heads=2):
@@ -174,11 +170,11 @@ class TimeSeriesModel(tf.keras.Model):
 
         self.norm = norm
         self.gru1 = tf.keras.layers.GRU(dims, return_sequences=True, seed=SEED)
-        self.gru2 = tf.keras.layers.GRU(dims, return_sequences=True, seed=SEED+1)
+        # self.gru2 = tf.keras.layers.GRU(dims, return_sequences=True, seed=SEED+1)
         self.lstm = tf.keras.layers.LSTM(dims, return_sequences=True, seed=SEED)
-        # self.conv1 = tf.keras.layers.Conv1D(dims, 3, padding='same')
+        self.conv1 = tf.keras.layers.Conv1D(dims, 3, padding='same')
         # self.conv2 = tf.keras.layers.Conv1D(dims, 3, padding='same')
-        # self.act1 = tf.keras.layers.Activation('gelu')
+        self.act1 = tf.keras.layers.Activation('gelu')
         # self.act2 = tf.keras.layers.Activation('gelu')
         self.t_dense = tf.keras.layers.TimeDistributed(
             tf.keras.layers.Dense(dims, activation='gelu'))
@@ -197,14 +193,13 @@ class TimeSeriesModel(tf.keras.Model):
         x = self.norm(x)
         
         x1 = self.gru1(self.permute1(x))
-        # x1= self.act1(x1)
         x1 = self.drop1(x1)
         
         x2 = self.lstm(self.permute2(x))
         x2 = self.drop2(x2)
         
-        x3 = self.gru2(self.permute3(x))
-        # x3= self.act2(x3)
+        x3 = self.conv1(self.permute3(x))
+        x3= self.act1(x3)
         x3 = self.drop3(x3)
         
         x4 = self.t_dense(self.permute4(x))
@@ -238,12 +233,11 @@ class TimeSeriesModel(tf.keras.Model):
             self.agr.trainable_variables +
             self.gru1.trainable_variables +
             self.lstm.trainable_variables +
-            self.gru2.trainable_variables +
+            self.conv1.trainable_variables +
             self.t_dense.trainable_variables +
             self.dense.trainable_variables +
             self.head.trainable_variables
         )
-
 
 # =========================================================== #
 #                         Functions                           #
@@ -335,12 +329,13 @@ def safe_entropy(P, eps):
     P = tf.clip_by_value(P, eps, 1.0)
     return -tf.reduce_mean(tf.reduce_sum(P * tf.math.log(P), axis=-1))
 
+
 @tf.function
 def train_step(x, y, apply_model_updates=True, apply_perm_updates=True, eps=1e-8):
     """
     Vectorized train step:
       - computes task loss
-      - builds stacked permutation matrices P_stack (K, F, F)
+      - builds stacked permutation matrices and their stats via compute_perm_stack_and_stats
       - computes per-permutation entropy (K,), repulsion (K,), advantage (K,)
       - forms perm-specific losses (K,) and applies per-perm gradient updates (if allowed)
       - updates model weights from task_loss (if allowed)
@@ -353,63 +348,22 @@ def train_step(x, y, apply_model_updates=True, apply_perm_updates=True, eps=1e-8
         # Forward pass
         y_pred = model(x, training=True)
         task_loss = loss_fn(y, y_pred)
-
-        # ---------------------------
-        # Build stacked permutation matrices P_stack (K, F, F)
-        # ---------------------------
+        # Vectorized perm stats (entry + spectral repulsion)
         temps = [tf.clip_by_value(temperatures[n], temp_min, temp_max) for n in perm_names]
-        logits_list = [p.logits for p in perm_layers]
-
-        # Compute Sinkhorn for each permutation and stack
-        # Using Python list comprehension is OK inside @tf.function here;
-        # each perm._sinkhorn is TF operations and will be part of the graph.
-        P_list = [perm._sinkhorn(logits / temp) for perm, logits, temp in zip(perm_layers, logits_list, temps)]
-        P_stack = tf.stack(P_list, axis=0)                            # (K, F, F)
-        P_stack = tf.clip_by_value(P_stack, SINKHORN_EPS, 1.0)
-
-        # ---------------------------
-        # Entropy (vectorized)
-        # ---------------------------
-        P_clamped = tf.clip_by_value(P_stack, eps, 1.0)
-        # per-permutation row-wise entropy then mean across rows -> shape (K,)
-        row_entropy_vec = -tf.reduce_mean(tf.reduce_sum(P_clamped * tf.math.log(P_clamped), axis=-1), axis=-1)
-
-        # ---------------------------
-        # Repulsion (vectorized pairwise L1 mean)
-        # ---------------------------
-        # Broadcast to (K, K, F, F)
-        P_i = tf.expand_dims(P_stack, 1)                # (K,1,F,F)
-        P_j = tf.expand_dims(tf.stop_gradient(P_stack), 0)  # (1,K,F,F) stop_gradient mirrors old code
-        pairwise_abs = tf.reduce_mean(tf.abs(P_i - P_j), axis=[-2, -1])  # (K, K)
-
-        # zero-out diagonal (self-distances)
-        K = tf.shape(pairwise_abs)[0]
-        eye = tf.eye(K, dtype=pairwise_abs.dtype)
-        pairwise_abs_no_diag = pairwise_abs * (1.0 - eye)
-
-        # repulsion per perm is sum of distances to other perms -> (K,)
-        repulsion_vec = tf.reduce_sum(pairwise_abs_no_diag, axis=1)
-
-        # ---------------------------
-        # Advantage (vectorized)
-        # ---------------------------
+        P_stack, row_entropy_vec, repulsion_vec_combined, pairwise_no_diag = \
+            compute_perm_stack_and_stats(perm_layers, temps, eps=eps)
+        # Advantage & per-perm losses (vectorized)
         mean_ent = tf.reduce_mean(row_entropy_vec)
         advantage_vec = mean_ent - row_entropy_vec
-
-        # ---------------------------
-        # Perm losses (vectorized)
-        # ---------------------------
         entropy_w_vec = tf.stack([entropy_weights[n] for n in perm_names])
         perm_loss_vec = (
             task_loss
             + entropy_w_vec * row_entropy_vec
             - BETA_ADV * advantage_vec
-            + GAMMA_REPEL * repulsion_vec
+            + GAMMA_REPEL * repulsion_vec_combined
         )
 
-    # ---------------------------
     # MODEL update (task loss)
-    # ---------------------------
     if apply_model_updates:
         grads_model = tape.gradient(task_loss, model.model_vars)
         safe_grads_model = []
@@ -420,18 +374,14 @@ def train_step(x, y, apply_model_updates=True, apply_perm_updates=True, eps=1e-8
                 safe_grads_model.append(tf.clip_by_norm(g, MODEL_GRAD_CLIP))
         optimizers["model"].apply_gradients(zip(safe_grads_model, model.model_vars))
     else:
-        # compute grads for diagnostics but do not apply
+        # optionally compute grads (for diagnostics) but do not apply
         _ = tape.gradient(task_loss, model.model_vars)
 
-    # ---------------------------
     # PERM updates (selective, preserve freeze logic)
-    # ---------------------------
-    perm_grad_norm = {
-        "p1": tf.constant(0.0, dtype=tf.float32),
-        "p2": tf.constant(0.0, dtype=tf.float32),
-        "p3": tf.constant(0.0, dtype=tf.float32),
-        "p4": tf.constant(0.0, dtype=tf.float32),
-    }
+    perm_grad_norm = {"p1": tf.constant(0.0, dtype=tf.float32),
+                      "p2": tf.constant(0.0, dtype=tf.float32),
+                      "p3": tf.constant(0.0, dtype=tf.float32),
+                      "p4": tf.constant(0.0, dtype=tf.float32)}
 
     for i, name in enumerate(perm_names):
         if (not apply_perm_updates) or frozen_vars[name]:
@@ -439,7 +389,6 @@ def train_step(x, y, apply_model_updates=True, apply_perm_updates=True, eps=1e-8
 
         perm = perm_layers[i]
         single_perm_loss = perm_loss_vec[i]
-
         grads = tape.gradient(single_perm_loss, perm.trainable_variables)
         safe_grads = []
         total_norm = tf.constant(0.0, dtype=tf.float32)
@@ -458,14 +407,13 @@ def train_step(x, y, apply_model_updates=True, apply_perm_updates=True, eps=1e-8
     # release tape
     del tape
 
-    # ---------------------------
     # Diagnostics: pairwise distances named dict
-    # ---------------------------
     pairwise_dist = {}
     for i in range(len(perm_names)):
         for j in range(i + 1, len(perm_names)):
             key = f"{perm_names[i]}_{perm_names[j]}"
-            pairwise_dist[key] = pairwise_abs_no_diag[i, j]
+            # pairwise_no_diag was mean L1 distances with diag zeroed
+            pairwise_dist[key] = pairwise_no_diag[i, j]
 
     # Row entropy as a dict keyed by perm name (keeps old API)
     row_entropy = {perm_names[i]: row_entropy_vec[i] for i in range(len(perm_names))}
@@ -477,13 +425,8 @@ def train_step(x, y, apply_model_updates=True, apply_perm_updates=True, eps=1e-8
         "pairwise_dist": pairwise_dist,
     }
 
-
-def epoch_controller_update(epoch,
-                            epoch_mean_loss,
-                            epoch_mean_entropies,   # dict {'p1':float,...}
-                            steps_in_epoch,
-                            apply_perm_updates=True,
-                            eps=1e-8):
+def epoch_controller_update(epoch, epoch_mean_loss, epoch_mean_entropies,   # dict {'p1':float,...}
+                            steps_in_epoch, apply_perm_updates=True, eps=1e-8):
     """
     Epoch-driven controller update with strict staggering:
       - If it's an entropy-update epoch (stagger interval reached), SKIP temperature updates this epoch.
@@ -504,9 +447,7 @@ def epoch_controller_update(epoch,
         last_entropy_epoch_int = int(last_entropy_update_epoch.numpy())
         do_entropy_update = (epoch_int - last_entropy_epoch_int) >= ENTROPY_UPDATE_GAP
         
-        # -----------------------
         # CASE A: Entropy-update epoch -> SKIP temperature updates this epoch
-        # -----------------------
         if do_entropy_update:
             # We intentionally DO NOT change temperatures here.
             # Entropy update will run using entropies computed under the same temperatures
@@ -535,12 +476,9 @@ def epoch_controller_update(epoch,
             # so next epoch's delta uses the correct baseline.
             for name in ["p1", "p2", "p3", "p4"]:
                 prev_entropy[name].assign(tf.convert_to_tensor(epoch_mean_entropies[name], tf.float32))
-
             # (Temperature controllers are skipped this epoch) -> no temperature assignments here
 
-        # -----------------------
         # CASE B: Regular epoch -> run temperature controllers (fast) and do not change entropy-weights
-        # -----------------------
         else:
             for name in ["p1", "p2", "p3", "p4"]:
                 if frozen_vars[name]:
@@ -561,21 +499,20 @@ def epoch_controller_update(epoch,
                     pred_delta = temp_controllers[name](state)  # (1,1)
                     pred_delta = tf.clip_by_value(pred_delta, -MAX_CONTROLLER_DELTA, MAX_CONTROLLER_DELTA)
                     pred_temp = tf.clip_by_value(temperatures[name] * tf.exp(pred_delta[0,0]), temp_min, temp_max)
-
                     # simulate predicted entropy under predicted temp (use layer's sinkhorn in eager)
                     perm = getattr(model, f"permute{name[-1]}")
                     logits_stop = tf.stop_gradient(perm.logits)
+                    
                     if hasattr(perm, "_sinkhorn"):
                         P_pred = perm._sinkhorn(logits_stop / pred_temp)
                     else:
                         P_pred = _tf_log_sinkhorn(logits_stop / pred_temp, perm.num_iters)
+
                     P_pred = tf.clip_by_value(P_pred, SINKHORN_EPS, 1.0)
                     pred_entropy = -tf.reduce_mean(tf.reduce_sum(P_pred * tf.math.log(P_pred + 1e-12), axis=-1))
-
                     # target entropy based on epoch mean entropies
                     mean_entropy = sum([epoch_mean_entropies[n] for n in ["p1","p2","p3","p4"]]) / 4.0
                     target_entropy = mean_entropy * 0.7
-
                     controller_loss = tf.reduce_mean(tf.square(pred_entropy - target_entropy))
 
                 # apply controller gradients
@@ -592,22 +529,17 @@ def epoch_controller_update(epoch,
 
                 # commit temperature change (fast update)
                 temperatures[name].assign(pred_temp)
-
                 # update prev_entropy baseline for next epoch delta calculation
                 prev_entropy[name].assign(tf.convert_to_tensor(epoch_mean_entropies[name], tf.float32))
-
             # Note: entropy_weights are NOT updated on this path
 
-    # -----------------------
     # Freeze counters and freeze decisions are evaluated every epoch (same behavior)
-    # -----------------------
     for name in ["p1","p2","p3","p4"]:
         ent = epoch_mean_entropies[name]
         stable = tf.logical_and(ent < ENTROPY_FREEZE_THRESH,
                                 tf.abs(ent - prev_entropy[name]) < 1e-6)
         prev_cnt = entropy_stable_count[name]
         entropy_stable_count[name].assign(tf.where(stable, prev_cnt + 1, tf.constant(0)))
-
         should_freeze = tf.logical_and(
             entropy_stable_count[name] >= STABLE_REQUIRED,
             tf.clip_by_value(temperatures[name], temp_min, temp_max) < TEMP_FREEZE_THRESH
@@ -682,39 +614,43 @@ def revert_permutation_state(snapshot):
 def simple_propose_gradient_step(step_size=1.0, batch=None, clip_norm=1.0):
     """
     Simple proposal: single small gradient step on the *sum* perm losses using one batch.
-    If batch not provided, grabs next batch from train_ds iterator.
-    This performs an in-place update to perm logits.
+    Performs an in-place update to perm logits.
     """
     if batch is None:
         batch = next(iter(train_ds))
     xb, yb = batch
+
+    perm_layers = [model.permute1, model.permute2, model.permute3, model.permute4]
+    perm_names  = ["p1","p2","p3","p4"]
+    temps = [tf.clip_by_value(temperatures[n], temp_min, temp_max) for n in perm_names]
+
     with tf.GradientTape() as t:
         y_pred = model(xb, training=True)
         task_loss = loss_fn(yb, y_pred)
-        
-        perm_layers = [model.permute1, model.permute2, model.permute3, model.permute4]
-        perm_names  = ["p1","p2","p3","p4"]
-        temps = [tf.clip_by_value(temperatures[n], temp_min, temp_max) for n in perm_names]
-        
+
         _, row_entropy_vec, _, _ = compute_perm_stack_and_stats(perm_layers, temps, eps=1e-8)
-        
         entropy_w_vec = tf.stack([entropy_weights[n] for n in perm_names])
         perm_losses_vec = task_loss + entropy_w_vec * row_entropy_vec  # (K,)
         obj = tf.reduce_sum(perm_losses_vec)
 
-    # grads wrt all perm logits (perm.logits are first var in each perm.trainable_variables here)
-    perm_vars = model.permute1.trainable_variables + model.permute2.trainable_variables + model.permute3.trainable_variables + model.permute4.trainable_variables
+    # grads wrt all perm logits (perm.logits are first var in each perm.trainable_variables)
+    perm_vars = (model.permute1.trainable_variables + model.permute2.trainable_variables +
+                 model.permute3.trainable_variables + model.permute4.trainable_variables)
     grads = t.gradient(obj, perm_vars)
     # apply small manual step
     idx = 0
     lr = 1e-3 * step_size
+    # iterate per-perm but use grads list (order matches perm_vars)
     for perm_name in ["p1","p2","p3","p4"]:
         perm = getattr(model, f"permute{perm_name[-1]}")
+        # the first trainable var should be logits; if not, this still works since grads align with vars
         g = grads[idx]
         idx += 1
         if g is None:
             continue
-        perm.logits.assign(perm.logits - lr * tf.clip_by_norm(g, clip_norm))
+        # clip and step
+        step_g = tf.clip_by_norm(g, clip_norm)
+        perm.logits.assign(perm.logits - lr * step_g)
 
 # @tf.function
 def run_epochs(num_epochs, apply_model_updates=True, apply_perm_updates=True, start_epoch=0):
@@ -762,10 +698,10 @@ def reinit_optimizers_and_slots():
     # recreate optimizer instances
     global optimizers
     optimizers["model"] = tf.keras.optimizers.AdamW(1e-3)
-    optimizers["perm"]["p1"] = tf.keras.optimizers.AdamW(1e-5)
-    optimizers["perm"]["p2"] = tf.keras.optimizers.AdamW(1e-5)
-    optimizers["perm"]["p3"] = tf.keras.optimizers.AdamW(1e-5)
-    optimizers["perm"]["p4"] = tf.keras.optimizers.AdamW(1e-5)
+    optimizers["perm"]["p1"] = tf.keras.optimizers.AdamW(1e-4)
+    optimizers["perm"]["p2"] = tf.keras.optimizers.AdamW(1e-4)
+    optimizers["perm"]["p3"] = tf.keras.optimizers.AdamW(1e-4)
+    optimizers["perm"]["p4"] = tf.keras.optimizers.AdamW(1e-4)
     optimizers["temperature"]["p1"] = tf.keras.optimizers.AdamW(1e-4)
     optimizers["temperature"]["p2"] = tf.keras.optimizers.AdamW(1e-4)
     optimizers["temperature"]["p3"] = tf.keras.optimizers.AdamW(1e-4)
@@ -773,15 +709,9 @@ def reinit_optimizers_and_slots():
     # re-run slot initializer
     initialize_optimizer_slots()
 
-# -----------------------------
 # High-level permutation-search driver
-# -----------------------------
-def permutation_search_cycle(total_cycles=50,
-                             baseline_epochs=3,
-                             adaptation_epochs=6,
-                             accept_rel_improve=0.003,
-                             patience_epochs=2,
-                             save_dir="perm_search_checkpoints"):
+def permutation_search_cycle(total_cycles=50, baseline_epochs=3, adaptation_epochs=6, accept_rel_improve=0.003,
+                             patience_epochs=2, save_dir="perm_search_checkpoints"):
     os.makedirs(save_dir, exist_ok=True)
     global epoch_global, best_val_loss
 
@@ -790,25 +720,19 @@ def permutation_search_cycle(total_cycles=50,
         # baseline: let model train with fixed permutations (no perm updates)
         run_epochs(baseline_epochs, apply_model_updates=True, apply_perm_updates=False, start_epoch=epoch_global)
         epoch_global += baseline_epochs
-
         baseline_val, baseline_mae = evaluate_on_val()
         print(f"Baseline val_loss: {baseline_val:.6g} mae: {baseline_mae:.6g}")
-
         # snapshot state before proposing
         snap = snapshot_permutation_state()
-
         # propose a small permutation change (gradient step or other)
         print("Proposing permutation update...")
         simple_propose_gradient_step(step_size=1.0)
-
         # adaptation: let the model adapt to the proposed permutation (perms now fixed during adaptation)
         print(f"Adaptation ({adaptation_epochs} epochs)...")
         run_epochs(adaptation_epochs, apply_model_updates=True, apply_perm_updates=False, start_epoch=epoch_global)
         epoch_global += adaptation_epochs
-
         new_val, new_mae = evaluate_on_val()
         print(f"Post-adapt val_loss: {new_val:.6g} mae: {new_mae:.6g}")
-
         rel_imp = (baseline_val - new_val) / max(1e-12, baseline_val)
         print(f"Relative improvement: {rel_imp:.6%}")
 
@@ -840,7 +764,7 @@ def permutation_search_cycle(total_cycles=50,
             # Optionally reinitialize optimizer state if a clean slate is required:
             # reinit_optimizers_and_slots()
 
-        # optional: run temperature-controller update after accepted permutation
+        # run temperature-controller update after accepted permutation
         if accepted:
             # we must supply epoch-aggregated stats from the last adaptation epoch for a correct update;
             # for brevity, compute a fresh evaluation as input (controller uses epoch metrics)
@@ -851,7 +775,6 @@ def permutation_search_cycle(total_cycles=50,
             temps = [tf.clip_by_value(temperatures[n], temp_min, temp_max) for n in perm_names]
             
             _, row_entropy_vec, _, _ = compute_perm_stack_and_stats(perm_layers, temps, eps=1e-8)
-            
             ent_summ = {perm_names[i]: float(row_entropy_vec[i].numpy()) for i in range(len(perm_names))}
 
             epoch_controller_update(epoch_global, val_loss_now, ent_summ, steps_in_epoch=1, apply_perm_updates=False)
@@ -860,49 +783,61 @@ def permutation_search_cycle(total_cycles=50,
         if new_val < best_val_loss:
             best_val_loss = new_val
             print("New best validation loss:", best_val_loss)
-
         print(f"End of cycle {cycle}; epoch_global={epoch_global}")
-
     print("Permutation search complete.")
 
 def compute_perm_stack_and_stats(perm_layers, temps, eps=1e-8):
     """
-    Vectorized helper that:
-      - computes Sinkhorn P for each perm in perm_layers under temps (list/tensor)
-      - returns (P_stack, row_entropy_vec, repulsion_vec, pairwise_no_diag)
-    Shapes:
+    Returns:
       P_stack: (K, F, F)
       row_entropy_vec: (K,)
-      repulsion_vec: (K,)         -> sum of distances to other perms
-      pairwise_no_diag: (K, K)    -> pairwise mean L1 distances with diag zeroed
+      repulsion_vec_combined: (K,)   # entry-wise + spectral combined
+      pairwise_no_diag: (K, K)
     """
-    # Collect logits and temps
+    # Build P_stack as before
     logits_list = [p.logits for p in perm_layers]
     temps_list = [tf.clip_by_value(t, temp_min, temp_max) for t in temps]
-
-    # compute Sinkhorn per-perm (each perm._sinkhorn uses TF ops)
     P_list = [perm._sinkhorn(logits / t) for perm, logits, t in zip(perm_layers, logits_list, temps_list)]
     P_stack = tf.stack(P_list, axis=0)                       # (K, F, F)
     P_stack = tf.clip_by_value(P_stack, SINKHORN_EPS, 1.0)
-
-    # Per-perm row entropy (same formula used elsewhere)
+    # Row entropy
     P_clamped = tf.clip_by_value(P_stack, eps, 1.0)
     row_entropy_vec = -tf.reduce_mean(tf.reduce_sum(P_clamped * tf.math.log(P_clamped), axis=-1), axis=-1)  # (K,)
-
-    # Pairwise L1 mean distances (broadcasted)
+    # Entry-wise pairwise distances (L1 mean), mirror previous logic
     P_i = tf.expand_dims(P_stack, 1)                          # (K,1,F,F)
-    P_j = tf.expand_dims(tf.stop_gradient(P_stack), 0)        # (1,K,F,F) stop_gradient to mirror earlier behavior
+    P_j = tf.expand_dims(tf.stop_gradient(P_stack), 0)        # (1,K,F,F)
     pairwise_abs = tf.reduce_mean(tf.abs(P_i - P_j), axis=[-2, -1])  # (K, K)
-
-    # zero diagonal & repulsion vector (sum distances to others)
     K = tf.shape(pairwise_abs)[0]
     eye = tf.eye(K, dtype=pairwise_abs.dtype)
     pairwise_no_diag = pairwise_abs * (1.0 - eye)
-    repulsion_vec = tf.reduce_sum(pairwise_no_diag, axis=1)    # (K,)
+    entry_repulsion_vec = tf.reduce_sum(pairwise_no_diag, axis=1)    # (K,)
+    # Compute P^1, P^2, ..., P^M using batch matmul.
+    Ppow = tf.identity(P_stack)  # (K, F, F) -> P^1
+    moments = [tf.math.real(tf.linalg.trace(Ppow))]  # list of length M
 
-    return P_stack, row_entropy_vec, repulsion_vec, pairwise_no_diag
-    
+    for _k in range(2, MOMENT_ORDER + 1):
+        # batch matmul: Ppow <- Ppow @ P_stack  (computes P^k)
+        Ppow = tf.matmul(Ppow, P_stack)
+        moments.append(tf.math.real(tf.linalg.trace(Ppow)))
 
+    # moments_stack: (K, M)
+    moments_stack = tf.stack(moments, axis=1)
+    # normalize moments per-perm to reduce scale effects
+    norms = tf.norm(moments_stack, axis=1, keepdims=True) + SPEC_EPS
+    moments_normed = moments_stack / norms
+    # pairwise spectral distances (L2) with stop_gradient on second operand
+    M_i = tf.expand_dims(moments_normed, 1)   # (K,1,M)
+    M_j = tf.expand_dims(tf.stop_gradient(moments_normed), 0)  # (1,K,M)
+    pairwise_spec = tf.sqrt(tf.reduce_sum(tf.square(M_i - M_j), axis=-1) + 1e-12)  # (K,K)
+    pairwise_spec_no_diag = pairwise_spec * (1.0 - eye)
+    spectral_repulsion_vec = tf.reduce_sum(pairwise_spec_no_diag, axis=1)  # (K,)
+    # here we make combined = entry + SPECTRAL_REPEL_WEIGHT * spectral
+    repulsion_vec_combined = entry_repulsion_vec + SPECTRAL_REPEL_WEIGHT * spectral_repulsion_vec
+    return P_stack, row_entropy_vec, repulsion_vec_combined, pairwise_no_diag
+
+# =========================================================== #
+#                    Running the script                       #
+# =========================================================== #
 WL = 8
 DIMS = 4
 EPOCHS = 10_000
@@ -911,12 +846,13 @@ DATASET = 'USDCHF_M1_245.csv'
 PATH = f'datasets/{DATASET}'
 
 X, y, features = load_data(PATH, WL, NUM_SAMPLES)
+print(f'\nNumber of features in final dataset: {len(features)}\n')
 
 split = int(0.9 * len(X))
 X_train, X_val = X[:split], X[split:]
 y_train, y_val = y[:split], y[split:]
 
-BATCH_SIZE = 32 #compute_batch_size(len(X_train))
+BATCH_SIZE = compute_batch_size(len(X_train))
 
 norm = tf.keras.layers.Normalization()
 norm.adapt(X_train)
@@ -1084,6 +1020,10 @@ MODEL_PHASE_EPOCHS = 10   # number of epochs to train model between perm-searche
 TOTAL_EPOCHS = EPOCHS
 assert PERM_PHASE_EPOCHS >= 1 and MODEL_PHASE_EPOCHS >= 1
 
+MOMENT_ORDER = 4               # 2..6 is a sensible range
+SPECTRAL_REPEL_WEIGHT = 0.5    # relative weight vs entry-wise repulsion (tune small -> 0.1..1.0)
+SPEC_EPS = 1e-9
+
 # step = tf.Variable(0, dtype=tf.int32) if 'step' not in globals() else step
 best_val_loss = np.inf
 history = {
@@ -1108,29 +1048,16 @@ for name in ["p1","p2","p3","p4"]:
     _ = temp_controllers[name](tf.zeros([1,4], dtype=tf.float32))
     _ = entropy_controllers[name](tf.zeros([1,4], dtype=tf.float32))
 
-
 # Called once to initialize optimizers outside @tf.function
 initialize_optimizer_slots()
-
 step = tf.Variable(0, dtype=tf.int32)
 epoch_global = 0
 
-
-
 # Run the search loop instead of the previous while loop
-permutation_search_cycle(total_cycles=10_000,
-                         baseline_epochs=10,
-                         adaptation_epochs=10,
-                         accept_rel_improve=0.003,
-                         patience_epochs=10,
-                         save_dir="perm_search_checkpoints")
+permutation_search_cycle(total_cycles=10_000, baseline_epochs=10, adaptation_epochs=10,
+                         accept_rel_improve=0.01, patience_epochs=10, save_dir="perm_search_checkpoints")
 
-
-# -----------------------------
 # After training: save history for plotting/analysis
-# -----------------------------
-import json
 with open("training_history.json", "w") as fh:
     json.dump(history, fh)
-
 print("Training finished. History saved to training_history.json")
