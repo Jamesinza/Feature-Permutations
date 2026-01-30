@@ -691,15 +691,17 @@ def simple_propose_gradient_step(step_size=1.0, batch=None, clip_norm=1.0):
     with tf.GradientTape() as t:
         y_pred = model(xb, training=True)
         task_loss = loss_fn(yb, y_pred)
-        # compute proxy perm losses (same structure as inside train_step)
-        perm_losses = []
-        for name in ["p1","p2","p3","p4"]:
-            perm = getattr(model, f"permute{name[-1]}")
-            temp = tf.clip_by_value(temperatures[name], temp_min, temp_max)
-            P = perm._sinkhorn(perm.logits / temp)
-            row_ent = safe_entropy(P, 1e-8)
-            perm_losses.append(task_loss + entropy_weights[name] * row_ent)
-        obj = tf.add_n(perm_losses)
+        
+        perm_layers = [model.permute1, model.permute2, model.permute3, model.permute4]
+        perm_names  = ["p1","p2","p3","p4"]
+        temps = [tf.clip_by_value(temperatures[n], temp_min, temp_max) for n in perm_names]
+        
+        _, row_entropy_vec, _, _ = compute_perm_stack_and_stats(perm_layers, temps, eps=1e-8)
+        
+        entropy_w_vec = tf.stack([entropy_weights[n] for n in perm_names])
+        perm_losses_vec = task_loss + entropy_w_vec * row_entropy_vec  # (K,)
+        obj = tf.reduce_sum(perm_losses_vec)
+
     # grads wrt all perm logits (perm.logits are first var in each perm.trainable_variables here)
     perm_vars = model.permute1.trainable_variables + model.permute2.trainable_variables + model.permute3.trainable_variables + model.permute4.trainable_variables
     grads = t.gradient(obj, perm_vars)
@@ -844,10 +846,14 @@ def permutation_search_cycle(total_cycles=50,
             # for brevity, compute a fresh evaluation as input (controller uses epoch metrics)
             val_loss_now, _ = evaluate_on_val()
             # compute dummy entropies for controller update (use current perms)
-            ent_summ = {}
-            for name in ["p1","p2","p3","p4"]:
-                Pcur = getattr(model, f"permute{name[-1]}")._sinkhorn(getattr(model, f"permute{name[-1]}").logits / temperatures[name])
-                ent_summ[name] = float(safe_entropy(Pcur, 1e-8).numpy())
+            perm_layers = [model.permute1, model.permute2, model.permute3, model.permute4]
+            perm_names  = ["p1","p2","p3","p4"]
+            temps = [tf.clip_by_value(temperatures[n], temp_min, temp_max) for n in perm_names]
+            
+            _, row_entropy_vec, _, _ = compute_perm_stack_and_stats(perm_layers, temps, eps=1e-8)
+            
+            ent_summ = {perm_names[i]: float(row_entropy_vec[i].numpy()) for i in range(len(perm_names))}
+
             epoch_controller_update(epoch_global, val_loss_now, ent_summ, steps_in_epoch=1, apply_perm_updates=False)
 
         # update best_val_loss
@@ -857,7 +863,45 @@ def permutation_search_cycle(total_cycles=50,
 
         print(f"End of cycle {cycle}; epoch_global={epoch_global}")
 
-    print("Permutation search complete.")    
+    print("Permutation search complete.")
+
+def compute_perm_stack_and_stats(perm_layers, temps, eps=1e-8):
+    """
+    Vectorized helper that:
+      - computes Sinkhorn P for each perm in perm_layers under temps (list/tensor)
+      - returns (P_stack, row_entropy_vec, repulsion_vec, pairwise_no_diag)
+    Shapes:
+      P_stack: (K, F, F)
+      row_entropy_vec: (K,)
+      repulsion_vec: (K,)         -> sum of distances to other perms
+      pairwise_no_diag: (K, K)    -> pairwise mean L1 distances with diag zeroed
+    """
+    # Collect logits and temps
+    logits_list = [p.logits for p in perm_layers]
+    temps_list = [tf.clip_by_value(t, temp_min, temp_max) for t in temps]
+
+    # compute Sinkhorn per-perm (each perm._sinkhorn uses TF ops)
+    P_list = [perm._sinkhorn(logits / t) for perm, logits, t in zip(perm_layers, logits_list, temps_list)]
+    P_stack = tf.stack(P_list, axis=0)                       # (K, F, F)
+    P_stack = tf.clip_by_value(P_stack, SINKHORN_EPS, 1.0)
+
+    # Per-perm row entropy (same formula used elsewhere)
+    P_clamped = tf.clip_by_value(P_stack, eps, 1.0)
+    row_entropy_vec = -tf.reduce_mean(tf.reduce_sum(P_clamped * tf.math.log(P_clamped), axis=-1), axis=-1)  # (K,)
+
+    # Pairwise L1 mean distances (broadcasted)
+    P_i = tf.expand_dims(P_stack, 1)                          # (K,1,F,F)
+    P_j = tf.expand_dims(tf.stop_gradient(P_stack), 0)        # (1,K,F,F) stop_gradient to mirror earlier behavior
+    pairwise_abs = tf.reduce_mean(tf.abs(P_i - P_j), axis=[-2, -1])  # (K, K)
+
+    # zero diagonal & repulsion vector (sum distances to others)
+    K = tf.shape(pairwise_abs)[0]
+    eye = tf.eye(K, dtype=pairwise_abs.dtype)
+    pairwise_no_diag = pairwise_abs * (1.0 - eye)
+    repulsion_vec = tf.reduce_sum(pairwise_no_diag, axis=1)    # (K,)
+
+    return P_stack, row_entropy_vec, repulsion_vec, pairwise_no_diag
+    
 
 WL = 8
 DIMS = 4
