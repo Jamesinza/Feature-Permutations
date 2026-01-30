@@ -401,11 +401,69 @@ def run_test(N=2000, WL=8, F=8, epochs=200, batch_size=256,
     start_temp = 1.0
     end_temp = 0.02
 
+    @tf.function()
+    def train_step(xb, yb):
+        with tf.GradientTape(persistent=True) as tape:
+            preds = model(xb, training=True, hard_perm=False)[:, 0]
+            loss_mse = mse(yb, preds)
+
+            Ps = [
+                model.permute1.soft_P(),
+                model.permute2.soft_P(),
+                model.permute3.soft_P(),
+                model.permute4.soft_P()
+            ]
+            P_stack = tf.stack(Ps, axis=0)
+            P_clamped = tf.clip_by_value(P_stack, 1e-9, 1.0)
+
+            # row sharpness
+            row_max = tf.reduce_mean(tf.reduce_max(P_clamped, axis=-1), axis=1)
+            mean_row_max = tf.reduce_mean(row_max)
+
+            # entropy (diagnostic but stays TF)
+            row_ent = -tf.reduce_mean(
+                tf.reduce_sum(P_clamped * tf.math.log(P_clamped + 1e-12), axis=-1),
+                axis=1
+            )
+            mean_ent = tf.reduce_mean(row_ent)
+
+            # repulsion
+            rep_sum = tf.constant(0.0, tf.float32)
+            for i in tf.range(4):
+                for j in tf.range(i + 1, 4):
+                    rep_sum += tf.reduce_mean(tf.abs(P_stack[i] - P_stack[j]))
+            Ff = tf.cast(tf.shape(P_stack)[1], tf.float32)
+            rep_norm = rep_sum / (Ff * Ff + 1e-12)
+
+            total_loss = loss_mse + (ENT_MODEL_SCALE * lambda_entropy) * (1.0 - mean_row_max)
+            perm_loss  = (lambda_entropy * (1.0 - mean_row_max)) - (gamma_repel * rep_norm)
+
+        grads_model = tape.gradient(total_loss, model_vars)
+        grads_perm  = tape.gradient(perm_loss, perm_vars)
+        del tape
+
+        grads_model = [tf.clip_by_norm(g, 5.0) if g is not None else tf.zeros_like(v)
+                       for g, v in zip(grads_model, model_vars)]
+        grads_perm = [tf.clip_by_norm(g, 2.0) if g is not None else tf.zeros_like(v)
+                      for g, v in zip(grads_perm, perm_vars)]
+
+        opt_model.apply_gradients(zip(grads_model, model_vars))
+        opt_perm.apply_gradients(zip(grads_perm, perm_vars))
+
+        return total_loss, mean_row_max, mean_ent, rep_norm
+
+    @tf.function()
+    def val_step(xv, yv):
+        preds = model(xv, training=False, hard_perm=False)[:, 0]
+        return mse(yv, preds)
+        
+        
+
     def temp_for_epoch(ep, max_ep):
         return start_temp * ((end_temp / start_temp) ** (ep / float(max_ep)))
 
-    patience = 20
-    min_delta = 1e-5
+    patience = 50
+    min_delta = 1e-6
     wait = 0
     best_val = float('inf')
     best_weights = None
@@ -424,59 +482,17 @@ def run_test(N=2000, WL=8, F=8, epochs=200, batch_size=256,
 
         # training
         for xb, yb in train_ds:
-            with tf.GradientTape(persistent=True) as tape:
-                preds = model(xb, training=True, hard_perm=False)[:, 0]
-                loss_mse = mse(yb, preds)
+            loss, row_max, ent, rep = train_step(xb, yb)
 
-                Ps = [p.soft_P() for p in [model.permute1, model.permute2, model.permute3, model.permute4]]
-                P_stack = tf.stack(Ps, axis=0)  # (4, F, F)
-                P_clamped = tf.clip_by_value(P_stack, 1e-9, 1.0)
-
-                # mean per-row max (sharpness)
-                row_max = tf.reduce_mean(tf.reduce_max(P_clamped, axis=-1), axis=1)  # (4,)
-                mean_row_max = tf.reduce_mean(row_max)
-
-                # entropy for diagnostics
-                row_ent = -tf.reduce_mean(tf.reduce_sum(P_clamped * tf.math.log(P_clamped + 1e-12), axis=-1), axis=1)
-                mean_ent = tf.reduce_mean(row_ent)
-
-                # pairwise L1 repulsion
-                rep_sum = tf.constant(0.0, dtype=tf.float32)
-                for i in range(4):
-                    for j in range(i + 1, 4):
-                        rep_sum += tf.reduce_mean(tf.abs(P_stack[i] - P_stack[j]))
-                Ff = tf.cast(tf.shape(P_stack)[1], tf.float32)
-                rep_norm = rep_sum / (Ff * Ff + 1e-12)
-
-                total_loss = loss_mse + (ENT_MODEL_SCALE * lambda_entropy) * (1.0 - mean_row_max)
-                perm_loss = (lambda_entropy * (1.0 - mean_row_max)) - (gamma_repel * rep_norm)
-
-            grads_model = tape.gradient(total_loss, model_vars)
-            grads_perm = tape.gradient(perm_loss, perm_vars)
-            del tape
-
-            grads_model = [(g if g is not None else tf.zeros_like(v)) for g, v in zip(grads_model, model_vars)]
-            grads_perm = [(g if g is not None else tf.zeros_like(v)) for g, v in zip(grads_perm, perm_vars)]
-
-            grads_model = [tf.clip_by_norm(g, 5.0) for g in grads_model]
-            grads_perm = [tf.clip_by_norm(g, 2.0) for g in grads_perm]
-
-            opt_model.apply_gradients(zip(grads_model, model_vars))
-            opt_perm.apply_gradients(zip(grads_perm, perm_vars))
-
-            ep_loss += float(total_loss.numpy())
+            ep_loss += float(loss)
             steps += 1
-
+            
         train_loss = ep_loss / max(1, steps)
 
         # validation
         val_loss = 0.0
-        vsteps = 0
         for xv, yv in val_ds:
-            vp = model(xv, training=False, hard_perm=False)[:, 0]
-            val_loss += float(mse(yv, vp).numpy())
-            vsteps += 1
-        val_loss = val_loss / max(1, vsteps)
+            val_loss += float(val_step(xv, yv))
 
         # logging stats (compute perms for diagnostics)
         Ps_np = [p.soft_P().numpy() for p in [model.permute1, model.permute2, model.permute3, model.permute4]]
@@ -493,7 +509,7 @@ def run_test(N=2000, WL=8, F=8, epochs=200, batch_size=256,
         history['ent'].append(float(np.mean(row_ent_np)))
         history['repulsion'].append(float(rep_np))
 
-        if verbose and (ep <= 10 or ep % max(1, epochs // 10) == 0):
+        if verbose:
             elapsed = time.time() - t0
             print(f"Epoch {ep:03d} | train {train_loss:.6f} val {val_loss:.6f} mean_row_max {row_max_np:.4f} ent {np.mean(row_ent_np):.4f} rep {rep_np:.4f} t={elapsed:.2f}s")
 
@@ -560,8 +576,8 @@ def run_test(N=2000, WL=8, F=8, epochs=200, batch_size=256,
 
 
 if __name__ == "__main__":
-    out = run_test(N=10000, WL=8, F=8, epochs=10000, batch_size=256,
-                   lr_model=1e-3, lr_perm=1e-3, lambda_entropy=0.6, gamma_repel=0.03,
+    out = run_test(N=10000, WL=8, F=8, epochs=10000, batch_size=1024,
+                   lr_model=1e-3, lr_perm=5e-3, lambda_entropy=0.6, gamma_repel=0.03,
                    hidden_dim=8, verbose=True)
 
     print('\nExperiment finished — returned dictionary `out`.')
