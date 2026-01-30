@@ -25,6 +25,33 @@ except Exception:
     SCIPY_AVAILABLE = False
     print("scipy not available — using greedy discrete assignment fallback.")
 
+def diagnostic_perm_stats(perms, perm_vars, perm_loss):
+    # perms: list of perm layers [model.permute1,...]
+    # perm_vars: list of trainable var Tensors corresponding to perm logits in same order
+    stats = {}
+    F = perms[0].num_features
+    uniform_entropy = float(np.log(F))
+    P_np = [p.soft_P().numpy() for p in perms]  # list (F,F)
+    ent_np = [np.mean(-np.sum(np.clip(P, 1e-12, 1.0) * np.log(np.clip(P, 1e-12, 1.0)), axis=-1)) for P in P_np]
+    stats['ent_per_branch'] = ent_np
+    stats['ent_mean'] = float(np.mean(ent_np))
+    stats['uniform_entropy'] = uniform_entropy
+    # logits norms
+    logits_np = [v.numpy() for v in perm_vars]
+    stats['logits_norm'] = [float(np.linalg.norm(l)) for l in logits_np]
+    stats['logits_mean_abs'] = [float(np.mean(np.abs(l))) for l in logits_np]
+    # KL to uniform per row averaged
+    kl_rows = []
+    for P in P_np:
+        q = np.ones_like(P) / F
+        kl = np.mean(np.sum(P * (np.log(np.clip(P,1e-12,1.0)) - np.log(q)), axis=-1))
+        kl_rows.append(float(kl))
+    stats['kl_uniform'] = kl_rows
+    print("DIAG: ent_mean {:.6f} (uniform {:.6f}); logits_norms {}; logits_mean_abs {}; KL_uniform {}"
+          .format(stats['ent_mean'], uniform_entropy, stats['logits_norm'], stats['logits_mean_abs'], stats['kl_uniform']))
+    return stats
+ 
+
 # ----------------------------
 # Recreate layers from experiment
 # ----------------------------
@@ -367,6 +394,28 @@ def run_test(N=3000, WL=16, F=8, epochs=200, batch_size=128,
             # compute grads separately and apply with respective optimizers
             grads_model = tape.gradient(total_loss, model_vars)
             grads_perm  = tape.gradient(perm_loss, perm_vars)
+
+            # ---------------------------------------------------------------- #
+            # --- Running a few extra diagnostics for more in depth checks --- #
+            # ---------------------------------------------------------------- #
+            grad_norms = [float(tf.norm(g).numpy()) if g is not None else 0.0 for g in grads_perm]
+            print("DIAG: perm grad norms:", grad_norms)
+            # Also print sign of dot product between logits and grads to see if optimizer drives logits toward zero
+            dot_products = []
+            for v, g in zip(perm_vars, grads_perm):
+                if g is None:
+                    dot_products.append(None)
+                else:
+                    dp = float(tf.reduce_sum(tf.stop_gradient(v) * g).numpy())
+                    dot_products.append(dp)
+            print("DIAG: logits·grad (negative -> grad reduces logits norm):", dot_products)
+            
+            diagnostic_perm_stats([model.permute1,model.permute2,model.permute3,model.permute4],
+                                  [model.permute1.logits,model.permute2.logits,model.permute3.logits,model.permute4.logits],
+                                  perm_loss)            
+            # ---------------------------------------------------------------- #
+            # --------------------- End of Diagnostics ----------------------- #
+            # ---------------------------------------------------------------- #
             
             # safe-guard None grads
             grads_model = [(g if g is not None else tf.zeros_like(v)) for g, v in zip(grads_model, model_vars)]
