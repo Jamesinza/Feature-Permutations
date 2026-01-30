@@ -1,5 +1,13 @@
 """
-Here we move away from step-based updates to epoch-driven update mechanisms
+Here we implement a more complex epoch-driven update system.
+
+Cycle:
+baseline phase → propose permutation → adaptation phase → evaluate → (accept/reject) → temperature controller update
+
+We run model training only in adaptation phases for full epochs.
+Perm proposals are applied only during perm-phase.
+Temperature controller training / committing happens only after adaptation and only if the perm change is accepted.
+All decisions are based on validation loss averaged over a small evaluation window to reduce variance.
 """
 
 import pandas as pd
@@ -8,6 +16,7 @@ import tensorflow as tf
 import random
 import math
 import matplotlib.pyplot as plt
+import pickle, os
 
 SEED = 42
 np.random.seed(SEED)
@@ -446,6 +455,7 @@ def epoch_controller_update(epoch,
     loss_tensor = tf.convert_to_tensor(epoch_mean_loss, dtype=tf.float32)
     loss_delta = tf.math.log(loss_tensor + eps) - tf.math.log(prev_loss + eps)
 
+    do_entropy_update = False
     if apply_perm_updates:
         # Determine whether this epoch is an entropy-update epoch
         epoch_int = int(epoch) if not isinstance(epoch, tf.Tensor) else int(epoch.numpy())
@@ -604,6 +614,120 @@ def initialize_optimizer_slots():
             opt.apply_gradients(zip(zero_grads, c_vars))
 
     print("\nOptimizer slot variables initialized.")
+
+def snapshot_permutation_state():
+    """Copy perm logits, temps, entropy_weights to a plain dict for revert if needed."""
+    return {
+        "p1": model.permute1.logits.numpy().copy(),
+        "p2": model.permute2.logits.numpy().copy(),
+        "p3": model.permute3.logits.numpy().copy(),
+        "p4": model.permute4.logits.numpy().copy(),
+        "temps": {n: float(temperatures[n].numpy()) for n in temperatures},
+        "entropy_weights": {n: float(entropy_weights[n].numpy()) for n in entropy_weights},
+    }
+
+def revert_permutation_state(snapshot):
+    """Re-assign logits, temps and entropy weights from a snapshot."""
+    model.permute1.logits.assign(snapshot["p1"])
+    model.permute2.logits.assign(snapshot["p2"])
+    model.permute3.logits.assign(snapshot["p3"])
+    model.permute4.logits.assign(snapshot["p4"])
+    for n in snapshot["temps"]:
+        temperatures[n].assign(snapshot["temps"][n])
+    for n in snapshot["entropy_weights"]:
+        entropy_weights[n].assign(snapshot["entropy_weights"][n])
+
+def simple_propose_gradient_step(step_size=1.0, batch=None, clip_norm=1.0):
+    """
+    Simple proposal: single small gradient step on the *sum* perm losses using one batch.
+    If batch not provided, grabs next batch from train_ds iterator.
+    This performs an in-place update to perm logits.
+    """
+    if batch is None:
+        batch = next(iter(train_ds))
+    xb, yb = batch
+    with tf.GradientTape() as t:
+        y_pred = model(xb, training=True)
+        task_loss = loss_fn(yb, y_pred)
+        # compute proxy perm losses (same structure as inside train_step)
+        perm_losses = []
+        for name in ["p1","p2","p3","p4"]:
+            perm = getattr(model, f"permute{name[-1]}")
+            temp = tf.clip_by_value(temperatures[name], temp_min, temp_max)
+            P = perm._sinkhorn(perm.logits / temp)
+            row_ent = safe_entropy(P, 1e-8)
+            perm_losses.append(task_loss + entropy_weights[name] * row_ent)
+        obj = tf.add_n(perm_losses)
+    # grads wrt all perm logits (perm.logits are first var in each perm.trainable_variables here)
+    perm_vars = model.permute1.trainable_variables + model.permute2.trainable_variables + model.permute3.trainable_variables + model.permute4.trainable_variables
+    grads = t.gradient(obj, perm_vars)
+    # apply small manual step
+    idx = 0
+    lr = 1e-3 * step_size
+    for perm_name in ["p1","p2","p3","p4"]:
+        perm = getattr(model, f"permute{perm_name[-1]}")
+        g = grads[idx]
+        idx += 1
+        if g is None:
+            continue
+        perm.logits.assign(perm.logits - lr * tf.clip_by_norm(g, clip_norm))
+
+# @tf.function
+def run_epochs(num_epochs, apply_model_updates=True, apply_perm_updates=True, start_epoch=0):
+    """
+    Run `num_epochs` epochs, using train_step with flags.
+    Returns a list of epoch summaries (dicts) for the run.
+    """
+    summaries = []
+    for e in range(num_epochs):
+        epoch_loss_sum = 0.0
+        epoch_ent_sums = {n: 0.0 for n in ["p1","p2","p3","p4"]}
+        steps_local = 0
+        for xb, yb in train_ds:
+            res = train_step(xb, yb, apply_model_updates=apply_model_updates, apply_perm_updates=apply_perm_updates)
+            # increment step counter
+            step.assign_add(1)
+            epoch_loss_sum += float(res["loss"].numpy())
+            steps_local += 1
+            for n in ["p1","p2","p3","p4"]:
+                epoch_ent_sums[n] += float(res["row_entropy"][n].numpy())
+        mean_loss = epoch_loss_sum / max(1, steps_local)
+        mean_ents = {n: epoch_ent_sums[n] / max(1, steps_local) for n in epoch_ent_sums}
+        # update controllers on epoch boundary using the aggregated stats
+        epoch_controller_update(start_epoch + e, mean_loss, mean_ents, steps_local, apply_perm_updates=apply_perm_updates)
+        summaries.append({"epoch": start_epoch + e, "train_loss": mean_loss, "entropies": mean_ents})
+    return summaries
+
+def evaluate_on_val():
+    """Return (val_loss, mae) averaged over val_ds."""
+    metric.reset_state()
+    val_loss_acc = 0.0
+    val_steps = 0
+    for xv, yv in val_ds:
+        vp = model(xv, training=False)
+        val_loss_acc += float(loss_fn(yv, vp).numpy())
+        metric.update_state(yv, vp)
+        val_steps += 1
+    return val_loss_acc / max(1, val_steps), float(metric.result().numpy())
+
+def reinit_optimizers_and_slots():
+    """
+    Optional helper: re-create optimizer objects and reinitialize their slots.
+    Called if we want to fully reset optimizer internal state after a big perm change.
+    """
+    # recreate optimizer instances
+    global optimizers
+    optimizers["model"] = tf.keras.optimizers.AdamW(1e-3)
+    optimizers["perm"]["p1"] = tf.keras.optimizers.AdamW(1e-5)
+    optimizers["perm"]["p2"] = tf.keras.optimizers.AdamW(1e-5)
+    optimizers["perm"]["p3"] = tf.keras.optimizers.AdamW(1e-5)
+    optimizers["perm"]["p4"] = tf.keras.optimizers.AdamW(1e-5)
+    optimizers["temperature"]["p1"] = tf.keras.optimizers.AdamW(1e-4)
+    optimizers["temperature"]["p2"] = tf.keras.optimizers.AdamW(1e-4)
+    optimizers["temperature"]["p3"] = tf.keras.optimizers.AdamW(1e-4)
+    optimizers["temperature"]["p4"] = tf.keras.optimizers.AdamW(1e-4)
+    # re-run slot initializer
+    initialize_optimizer_slots()    
 
 WL = 8
 DIMS = 4
@@ -779,9 +903,9 @@ ENTROPY_UPDATE_FACTOR = 1.05  # multiplicative factor; use >1 to increase when e
 # Outer loop: Alternating phases (perm-phase then model-phase)
 # -----------------------------
 # Tuning hyperparams
-ENTROPY_UPDATE_GAP = 1   # try 3-10; 5 is a safe default
-PERM_PHASE_EPOCHS = 1    # number of epochs to run perm-search
-MODEL_PHASE_EPOCHS = 5   # number of epochs to train model between perm-searches
+ENTROPY_UPDATE_GAP = 5   # try 3-10; 5 is a safe default
+PERM_PHASE_EPOCHS = 5    # number of epochs to run perm-search
+MODEL_PHASE_EPOCHS = 10   # number of epochs to train model between perm-searches
 # cycle_len = PERM_PHASE_EPOCHS + MODEL_PHASE_EPOCHS
 TOTAL_EPOCHS = EPOCHS
 assert PERM_PHASE_EPOCHS >= 1 and MODEL_PHASE_EPOCHS >= 1
@@ -814,117 +938,105 @@ for name in ["p1","p2","p3","p4"]:
 # Called once to initialize optimizers outside @tf.function
 initialize_optimizer_slots()
 
+step = tf.Variable(0, dtype=tf.int32)
 epoch_global = 0
-while epoch_global < TOTAL_EPOCHS:
-    
-    # ---------- Model-train phase ----------
-    for me in range(MODEL_PHASE_EPOCHS):
-        epoch_loss_sum = 0.0
-        epoch_ent_sums = {"p1": 0.0, "p2": 0.0, "p3": 0.0, "p4": 0.0}
-        steps = 0
 
-        # In model-train phase: update model weights, freeze perm updates
-        for x_batch, y_batch in train_ds:
-            res = train_step(x_batch, y_batch, apply_model_updates=True, apply_perm_updates=False)
-            # step.assign_add(1)
-            epoch_loss_sum += float(res['loss'].numpy())
-            steps += 1
-            for n in ["p1","p2","p3","p4"]:
-                epoch_ent_sums[n] += float(res['row_entropy'][n].numpy())
+# -----------------------------
+# High-level permutation-search driver
+# -----------------------------
+def permutation_search_cycle(total_cycles=50,
+                             baseline_epochs=3,
+                             adaptation_epochs=6,
+                             accept_rel_improve=0.003,
+                             patience_epochs=2,
+                             save_dir="perm_search_checkpoints"):
+    os.makedirs(save_dir, exist_ok=True)
+    global epoch_global, best_val_loss
 
-        epoch_mean_loss = epoch_loss_sum / max(1, steps)
-        epoch_mean_entropies = {n: epoch_ent_sums[n] / max(1, steps) for n in epoch_ent_sums}
+    for cycle in range(total_cycles):
+        print(f"\n=== CYCLE {cycle} — BASELINE ({baseline_epochs} epochs) ===")
+        # baseline: let model train with fixed permutations (no perm updates)
+        run_epochs(baseline_epochs, apply_model_updates=True, apply_perm_updates=False, start_epoch=epoch_global)
+        epoch_global += baseline_epochs
 
-        # epoch-level controller update (stagger rules apply inside epoch_controller_update)
-        epoch_diag = epoch_controller_update(epoch_global, epoch_mean_loss, epoch_mean_entropies, steps, apply_perm_updates=False)
+        baseline_val, baseline_mae = evaluate_on_val()
+        print(f"Baseline val_loss: {baseline_val:.6g} mae: {baseline_mae:.6g}")
 
-        # validation after epoch
-        metric.reset_state()
-        val_loss_acc = 0.0
-        val_steps = 0
-        for xv, yv in val_ds:
-            vp = model(xv, training=False)
-            val_loss_acc += float(loss_fn(yv, vp).numpy())
-            metric.update_state(yv, vp)
-            val_steps += 1
-        val_loss = val_loss_acc / max(1, val_steps)
-        mae = float(metric.result().numpy())
+        # snapshot state before proposing
+        snap = snapshot_permutation_state()
 
-        # logging
-        print(f"\n[Epoch {epoch_global+1} | MODEL-PHASE] loss: {epoch_mean_loss:.3g} | val_loss: {val_loss:.3g} | mae: {mae:.3g}")
-        for n in ["p1","p2","p3","p4"]:
-            print(f"{n}:\tEnt: {epoch_mean_entropies[n]:.6g} | Temp: {float(temperatures[n].numpy()):.5g} | EntW: {float(entropy_weights[n].numpy()):.6g} | Frozen: {bool(frozen_vars[n].numpy())}")
+        # propose a small permutation change (gradient step or other)
+        print("Proposing permutation update...")
+        simple_propose_gradient_step(step_size=1.0)
 
-        # store history
-        history['epoch'].append(epoch_global); history['phase'].append('model')
-        history['epoch_loss'].append(epoch_mean_loss); history['val_loss'].append(val_loss); history['mae'].append(mae)
-        for n, k in zip(["p1","p2","p3","p4"], ['ent_p1','ent_p2','ent_p3','ent_p4']):
-            history[k].append(epoch_mean_entropies[n])
-        for n, k in zip(["p1","p2","p3","p4"], ['temp_p1','temp_p2','temp_p3','temp_p4']):
-            history[k].append(float(temperatures[n].numpy()))
-        for n, k in zip(["p1","p2","p3","p4"], ['entw_p1','entw_p2','entw_p3','entw_p4']):
-            history[k].append(float(entropy_weights[n].numpy()))
-        history['frozen'].append({n: bool(frozen_vars[n].numpy()) for n in ["p1","p2","p3","p4"]})
+        # adaptation: let the model adapt to the proposed permutation (perms now fixed during adaptation)
+        print(f"Adaptation ({adaptation_epochs} epochs)...")
+        run_epochs(adaptation_epochs, apply_model_updates=True, apply_perm_updates=False, start_epoch=epoch_global)
+        epoch_global += adaptation_epochs
 
-        epoch_global += 1
-        if epoch_global >= TOTAL_EPOCHS:
-            break
-            
-    # ---------- Perm-search phase ----------
-    for pe in range(PERM_PHASE_EPOCHS):
-        # accumulators for epoch-level aggregation
-        epoch_loss_sum = 0.0
-        epoch_ent_sums = {"p1": 0.0, "p2": 0.0, "p3": 0.0, "p4": 0.0}
-        steps = 0
+        new_val, new_mae = evaluate_on_val()
+        print(f"Post-adapt val_loss: {new_val:.6g} mae: {new_mae:.6g}")
 
-        # In perm-search phase: do not update model weights, allow perm updates
-        for x_batch, y_batch in train_ds:
-            res = train_step(x_batch, y_batch, apply_model_updates=False, apply_perm_updates=True)
-            # step.assign_add(1)
-            epoch_loss_sum += float(res['loss'].numpy())
-            steps += 1
-            for n in ["p1","p2","p3","p4"]:
-                epoch_ent_sums[n] += float(res['row_entropy'][n].numpy())
+        rel_imp = (baseline_val - new_val) / max(1e-12, baseline_val)
+        print(f"Relative improvement: {rel_imp:.6%}")
 
-        epoch_mean_loss = epoch_loss_sum / max(1, steps)
-        epoch_mean_entropies = {n: epoch_ent_sums[n] / max(1, steps) for n in epoch_ent_sums}
+        accepted = False
+        if rel_imp >= accept_rel_improve:
+            # stability quick check
+            print("Tentatively accepted. Running stability window...")
+            run_epochs(patience_epochs, apply_model_updates=True, apply_perm_updates=False, start_epoch=epoch_global)
+            epoch_global += patience_epochs
+            val_after = evaluate_on_val()[0]
+            if val_after <= new_val * 1.001:
+                accepted = True
+                print("Permutation accepted.")
+                # save accepted permutation and model weights
+                np.save(os.path.join(save_dir, f"perms_accepted_cycle_{cycle}.npy"), {
+                    "p1": model.permute1.logits.numpy(),
+                    "p2": model.permute2.logits.numpy(),
+                    "p3": model.permute3.logits.numpy(),
+                    "p4": model.permute4.logits.numpy()
+                })
+                model.save_weights(os.path.join(save_dir, f"model_after_cycle_{cycle}.weights.h5"))
+            else:
+                print("Stability check failed. Reverting.")
+        else:
+            print("Rejected: insufficient improvement.")
 
-        # epoch-driven controller update (this will perform temp updates or entropy updates depending on staggers)
-        epoch_diag = epoch_controller_update(epoch_global, epoch_mean_loss, epoch_mean_entropies, steps, apply_perm_updates=True)
+        if not accepted:
+            revert_permutation_state(snap)
+            # Optionally reinitialize optimizer state if a clean slate is required:
+            # reinit_optimizers_and_slots()
 
-        # validation after epoch (evaluate model on val set; model hasn't changed in this phase but we still check)
-        metric.reset_state()
-        val_loss_acc = 0.0
-        val_steps = 0
-        for xv, yv in val_ds:
-            vp = model(xv, training=False)
-            val_loss_acc += float(loss_fn(yv, vp).numpy())
-            metric.update_state(yv, vp)
-            val_steps += 1
-        val_loss = val_loss_acc / max(1, val_steps)
-        mae = float(metric.result().numpy())
+        # optional: run temperature-controller update after accepted permutation
+        if accepted:
+            # we must supply epoch-aggregated stats from the last adaptation epoch for a correct update;
+            # for brevity, compute a fresh evaluation as input (controller uses epoch metrics)
+            val_loss_now, _ = evaluate_on_val()
+            # compute dummy entropies for controller update (use current perms)
+            ent_summ = {}
+            for name in ["p1","p2","p3","p4"]:
+                Pcur = getattr(model, f"permute{name[-1]}")._sinkhorn(getattr(model, f"permute{name[-1]}").logits / temperatures[name])
+                ent_summ[name] = float(safe_entropy(Pcur, 1e-8).numpy())
+            epoch_controller_update(epoch_global, val_loss_now, ent_summ, steps_in_epoch=1, apply_perm_updates=False)
 
-        # logging
-        print(f"\n[Epoch {epoch_global+1} | PERM-PHASE] loss: {epoch_mean_loss:.3g} | val_loss: {val_loss:.3g} | mae: {mae:.3g}")
-        for n in ["p1","p2","p3","p4"]:
-            print(f"{n}:\tEnt: {epoch_mean_entropies[n]:.6g} | Temp: {float(temperatures[n].numpy()):.5g} | EntW: {float(entropy_weights[n].numpy()):.6g} | Frozen: {bool(frozen_vars[n].numpy())}")
-        # store history
-        history['epoch'].append(epoch_global); history['phase'].append('perm')
-        history['epoch_loss'].append(epoch_mean_loss); history['val_loss'].append(val_loss); history['mae'].append(mae)
-        for n, k in zip(["p1","p2","p3","p4"], ['ent_p1','ent_p2','ent_p3','ent_p4']):
-            history[k].append(epoch_mean_entropies[n])
-        for n, k in zip(["p1","p2","p3","p4"], ['temp_p1','temp_p2','temp_p3','temp_p4']):
-            history[k].append(float(temperatures[n].numpy()))
-        for n, k in zip(["p1","p2","p3","p4"], ['entw_p1','entw_p2','entw_p3','entw_p4']):
-            history[k].append(float(entropy_weights[n].numpy()))
-        history['frozen'].append({n: bool(frozen_vars[n].numpy()) for n in ["p1","p2","p3","p4"]})
+        # update best_val_loss
+        if new_val < best_val_loss:
+            best_val_loss = new_val
+            print("New best validation loss:", best_val_loss)
 
-        epoch_global += 1
-        if epoch_global >= TOTAL_EPOCHS:
-            break
+        print(f"End of cycle {cycle}; epoch_global={epoch_global}")
 
-    if epoch_global >= TOTAL_EPOCHS:
-        break
+    print("Permutation search complete.")
+
+# Run the search loop instead of the previous while loop
+permutation_search_cycle(total_cycles=10_000,
+                         baseline_epochs=10,
+                         adaptation_epochs=10,
+                         accept_rel_improve=0.003,
+                         patience_epochs=10,
+                         save_dir="perm_search_checkpoints")
+
 
 # -----------------------------
 # After training: save history for plotting/analysis
