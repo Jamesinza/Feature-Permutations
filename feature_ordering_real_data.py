@@ -338,52 +338,78 @@ def safe_entropy(P, eps):
 @tf.function
 def train_step(x, y, apply_model_updates=True, apply_perm_updates=True, eps=1e-8):
     """
-    Performs a single training step (batch). Does NOT update controllers or freeze counters.
-    Skips perm updates for permutations currently frozen in frozen_vars.
+    Vectorized train step:
+      - computes task loss
+      - builds stacked permutation matrices P_stack (K, F, F)
+      - computes per-permutation entropy (K,), repulsion (K,), advantage (K,)
+      - forms perm-specific losses (K,) and applies per-perm gradient updates (if allowed)
+      - updates model weights from task_loss (if allowed)
     Returns diagnostics for aggregation at epoch end.
     """
+    perm_names = ["p1", "p2", "p3", "p4"]
+    perm_layers = [model.permute1, model.permute2, model.permute3, model.permute4]
 
     with tf.GradientTape(persistent=True) as tape:
+        # Forward pass
         y_pred = model(x, training=True)
         task_loss = loss_fn(y, y_pred)
 
-        # Build permutations and compute per-branch entropy (no controller updates here)
-        P = {}
-        row_entropy = {}
-        repulsion = {}
+        # ---------------------------
+        # Build stacked permutation matrices P_stack (K, F, F)
+        # ---------------------------
+        temps = [tf.clip_by_value(temperatures[n], temp_min, temp_max) for n in perm_names]
+        logits_list = [p.logits for p in perm_layers]
 
-        for name, perm in zip(["p1","p2","p3","p4"],
-                              [model.permute1, model.permute2, model.permute3, model.permute4]):
-            temp = tf.clip_by_value(temperatures[name], temp_min, temp_max)
-            log_alpha = perm.logits / temp
-            Pi = perm._sinkhorn(log_alpha)
-            Pi = tf.clip_by_value(Pi, SINKHORN_EPS, 1.0)
-            P[name] = Pi
-            P_clamped = tf.clip_by_value(Pi, eps, 1.0)
-            row_entropy[name] = -tf.reduce_mean(tf.reduce_sum(P_clamped * tf.math.log(P_clamped), axis=-1))
+        # Compute Sinkhorn for each permutation and stack
+        # Using Python list comprehension is OK inside @tf.function here;
+        # each perm._sinkhorn is TF operations and will be part of the graph.
+        P_list = [perm._sinkhorn(logits / temp) for perm, logits, temp in zip(perm_layers, logits_list, temps)]
+        P_stack = tf.stack(P_list, axis=0)                            # (K, F, F)
+        P_stack = tf.clip_by_value(P_stack, SINKHORN_EPS, 1.0)
 
-        # repulsion
-        for i in P:
-            repulsion[i] = 0.0
-            for j in P:
-                if i != j:
-                    repulsion[i] += tf.reduce_mean(tf.abs(P[i] - tf.stop_gradient(P[j])))
+        # ---------------------------
+        # Entropy (vectorized)
+        # ---------------------------
+        P_clamped = tf.clip_by_value(P_stack, eps, 1.0)
+        # per-permutation row-wise entropy then mean across rows -> shape (K,)
+        row_entropy_vec = -tf.reduce_mean(tf.reduce_sum(P_clamped * tf.math.log(P_clamped), axis=-1), axis=-1)
 
-        # advantage (not strictly needed here but compute for perm loss)
-        mean_ent = tf.add_n(list(row_entropy.values())) / tf.cast(len(row_entropy), tf.float32)
-        advantage = {k: mean_ent - row_entropy[k] for k in row_entropy}
+        # ---------------------------
+        # Repulsion (vectorized pairwise L1 mean)
+        # ---------------------------
+        # Broadcast to (K, K, F, F)
+        P_i = tf.expand_dims(P_stack, 1)                # (K,1,F,F)
+        P_j = tf.expand_dims(tf.stop_gradient(P_stack), 0)  # (1,K,F,F) stop_gradient mirrors old code
+        pairwise_abs = tf.reduce_mean(tf.abs(P_i - P_j), axis=[-2, -1])  # (K, K)
 
-        # permutation-specific losses
-        perm_loss = {}
-        for name in P:
-            perm_loss[name] = (
-                task_loss
-                + entropy_weights[name] * row_entropy[name]
-                - BETA_ADV * advantage[name]
-                + GAMMA_REPEL * repulsion[name]
-            )
+        # zero-out diagonal (self-distances)
+        K = tf.shape(pairwise_abs)[0]
+        eye = tf.eye(K, dtype=pairwise_abs.dtype)
+        pairwise_abs_no_diag = pairwise_abs * (1.0 - eye)
 
-    # MODEL update (only if apply_model_updates)
+        # repulsion per perm is sum of distances to other perms -> (K,)
+        repulsion_vec = tf.reduce_sum(pairwise_abs_no_diag, axis=1)
+
+        # ---------------------------
+        # Advantage (vectorized)
+        # ---------------------------
+        mean_ent = tf.reduce_mean(row_entropy_vec)
+        advantage_vec = mean_ent - row_entropy_vec
+
+        # ---------------------------
+        # Perm losses (vectorized)
+        # ---------------------------
+        entropy_w_vec = tf.stack([entropy_weights[n] for n in perm_names])
+        perm_loss_vec = (
+            task_loss
+            + entropy_w_vec * row_entropy_vec
+            - BETA_ADV * advantage_vec
+            + GAMMA_REPEL * repulsion_vec
+        )
+
+    # ---------------------------
+    # MODEL update (task loss)
+    # ---------------------------
     if apply_model_updates:
         grads_model = tape.gradient(task_loss, model.model_vars)
         safe_grads_model = []
@@ -394,19 +420,30 @@ def train_step(x, y, apply_model_updates=True, apply_perm_updates=True, eps=1e-8
                 safe_grads_model.append(tf.clip_by_norm(g, MODEL_GRAD_CLIP))
         optimizers["model"].apply_gradients(zip(safe_grads_model, model.model_vars))
     else:
-        # optionally compute grads (for diagnostics) but do not apply
+        # compute grads for diagnostics but do not apply
         _ = tape.gradient(task_loss, model.model_vars)
 
-    # PERM updates (only if apply_perm_updates and not frozen)
-    perm_grad_norm = {"p1": 0.0, "p2":0.0, "p3":0.0, "p4":0.0}
-    for name in P:
-        if not apply_perm_updates or frozen_vars[name]:
+    # ---------------------------
+    # PERM updates (selective, preserve freeze logic)
+    # ---------------------------
+    perm_grad_norm = {
+        "p1": tf.constant(0.0, dtype=tf.float32),
+        "p2": tf.constant(0.0, dtype=tf.float32),
+        "p3": tf.constant(0.0, dtype=tf.float32),
+        "p4": tf.constant(0.0, dtype=tf.float32),
+    }
+
+    for i, name in enumerate(perm_names):
+        if (not apply_perm_updates) or frozen_vars[name]:
             continue
-        perm = getattr(model, f"permute{name[-1]}")
-        single_perm_loss = perm_loss[name]
+
+        perm = perm_layers[i]
+        single_perm_loss = perm_loss_vec[i]
+
         grads = tape.gradient(single_perm_loss, perm.trainable_variables)
         safe_grads = []
-        total_norm = tf.constant(0.0)
+        total_norm = tf.constant(0.0, dtype=tf.float32)
+
         for g, v in zip(grads, perm.trainable_variables):
             if g is None:
                 safe_grads.append(tf.zeros_like(v))
@@ -414,27 +451,32 @@ def train_step(x, y, apply_model_updates=True, apply_perm_updates=True, eps=1e-8
                 clipped = tf.clip_by_norm(g, PERM_GRAD_CLIP)
                 safe_grads.append(clipped)
                 total_norm += tf.reduce_sum(tf.square(clipped))
+
         perm_grad_norm[name] = tf.sqrt(total_norm)
         optimizers["perm"][name].apply_gradients(zip(safe_grads, perm.trainable_variables))
 
-
+    # release tape
     del tape
 
-    # compute pairwise distances (diagnostic)
+    # ---------------------------
+    # Diagnostics: pairwise distances named dict
+    # ---------------------------
     pairwise_dist = {}
-    names = list(P.keys())
-    for i in range(len(names)):
-        for j in range(i+1, len(names)):
-            a = names[i]; b = names[j]
-            pairwise_dist[f"{a}_{b}"] = tf.reduce_mean(tf.abs(P[a] - P[b]))
+    for i in range(len(perm_names)):
+        for j in range(i + 1, len(perm_names)):
+            key = f"{perm_names[i]}_{perm_names[j]}"
+            pairwise_dist[key] = pairwise_abs_no_diag[i, j]
 
-    # Return raw values for epoch aggregation (they may be tf.Tensors)
+    # Row entropy as a dict keyed by perm name (keeps old API)
+    row_entropy = {perm_names[i]: row_entropy_vec[i] for i in range(len(perm_names))}
+
     return {
         "loss": task_loss,
         "row_entropy": row_entropy,
         "perm_grad_norm": perm_grad_norm,
         "pairwise_dist": pairwise_dist,
     }
+
 
 def epoch_controller_update(epoch,
                             epoch_mean_loss,
@@ -727,7 +769,95 @@ def reinit_optimizers_and_slots():
     optimizers["temperature"]["p3"] = tf.keras.optimizers.AdamW(1e-4)
     optimizers["temperature"]["p4"] = tf.keras.optimizers.AdamW(1e-4)
     # re-run slot initializer
-    initialize_optimizer_slots()    
+    initialize_optimizer_slots()
+
+# -----------------------------
+# High-level permutation-search driver
+# -----------------------------
+def permutation_search_cycle(total_cycles=50,
+                             baseline_epochs=3,
+                             adaptation_epochs=6,
+                             accept_rel_improve=0.003,
+                             patience_epochs=2,
+                             save_dir="perm_search_checkpoints"):
+    os.makedirs(save_dir, exist_ok=True)
+    global epoch_global, best_val_loss
+
+    for cycle in range(total_cycles):
+        print(f"\n=== CYCLE {cycle} — BASELINE ({baseline_epochs} epochs) ===")
+        # baseline: let model train with fixed permutations (no perm updates)
+        run_epochs(baseline_epochs, apply_model_updates=True, apply_perm_updates=False, start_epoch=epoch_global)
+        epoch_global += baseline_epochs
+
+        baseline_val, baseline_mae = evaluate_on_val()
+        print(f"Baseline val_loss: {baseline_val:.6g} mae: {baseline_mae:.6g}")
+
+        # snapshot state before proposing
+        snap = snapshot_permutation_state()
+
+        # propose a small permutation change (gradient step or other)
+        print("Proposing permutation update...")
+        simple_propose_gradient_step(step_size=1.0)
+
+        # adaptation: let the model adapt to the proposed permutation (perms now fixed during adaptation)
+        print(f"Adaptation ({adaptation_epochs} epochs)...")
+        run_epochs(adaptation_epochs, apply_model_updates=True, apply_perm_updates=False, start_epoch=epoch_global)
+        epoch_global += adaptation_epochs
+
+        new_val, new_mae = evaluate_on_val()
+        print(f"Post-adapt val_loss: {new_val:.6g} mae: {new_mae:.6g}")
+
+        rel_imp = (baseline_val - new_val) / max(1e-12, baseline_val)
+        print(f"Relative improvement: {rel_imp:.6%}")
+
+        accepted = False
+        if rel_imp >= accept_rel_improve:
+            # stability quick check
+            print("Tentatively accepted. Running stability window...")
+            run_epochs(patience_epochs, apply_model_updates=True, apply_perm_updates=False, start_epoch=epoch_global)
+            epoch_global += patience_epochs
+            val_after = evaluate_on_val()[0]
+            if val_after <= new_val * 1.001:
+                accepted = True
+                print("Permutation accepted.")
+                # save accepted permutation and model weights
+                np.save(os.path.join(save_dir, f"perms_accepted_cycle_{cycle}.npy"), {
+                    "p1": model.permute1.logits.numpy(),
+                    "p2": model.permute2.logits.numpy(),
+                    "p3": model.permute3.logits.numpy(),
+                    "p4": model.permute4.logits.numpy()
+                })
+                model.save_weights(os.path.join(save_dir, f"model_after_cycle_{cycle}.weights.h5"))
+            else:
+                print("Stability check failed. Reverting.")
+        else:
+            print("Rejected: insufficient improvement.")
+
+        if not accepted:
+            revert_permutation_state(snap)
+            # Optionally reinitialize optimizer state if a clean slate is required:
+            # reinit_optimizers_and_slots()
+
+        # optional: run temperature-controller update after accepted permutation
+        if accepted:
+            # we must supply epoch-aggregated stats from the last adaptation epoch for a correct update;
+            # for brevity, compute a fresh evaluation as input (controller uses epoch metrics)
+            val_loss_now, _ = evaluate_on_val()
+            # compute dummy entropies for controller update (use current perms)
+            ent_summ = {}
+            for name in ["p1","p2","p3","p4"]:
+                Pcur = getattr(model, f"permute{name[-1]}")._sinkhorn(getattr(model, f"permute{name[-1]}").logits / temperatures[name])
+                ent_summ[name] = float(safe_entropy(Pcur, 1e-8).numpy())
+            epoch_controller_update(epoch_global, val_loss_now, ent_summ, steps_in_epoch=1, apply_perm_updates=False)
+
+        # update best_val_loss
+        if new_val < best_val_loss:
+            best_val_loss = new_val
+            print("New best validation loss:", best_val_loss)
+
+        print(f"End of cycle {cycle}; epoch_global={epoch_global}")
+
+    print("Permutation search complete.")    
 
 WL = 8
 DIMS = 4
@@ -941,93 +1071,7 @@ initialize_optimizer_slots()
 step = tf.Variable(0, dtype=tf.int32)
 epoch_global = 0
 
-# -----------------------------
-# High-level permutation-search driver
-# -----------------------------
-def permutation_search_cycle(total_cycles=50,
-                             baseline_epochs=3,
-                             adaptation_epochs=6,
-                             accept_rel_improve=0.003,
-                             patience_epochs=2,
-                             save_dir="perm_search_checkpoints"):
-    os.makedirs(save_dir, exist_ok=True)
-    global epoch_global, best_val_loss
 
-    for cycle in range(total_cycles):
-        print(f"\n=== CYCLE {cycle} — BASELINE ({baseline_epochs} epochs) ===")
-        # baseline: let model train with fixed permutations (no perm updates)
-        run_epochs(baseline_epochs, apply_model_updates=True, apply_perm_updates=False, start_epoch=epoch_global)
-        epoch_global += baseline_epochs
-
-        baseline_val, baseline_mae = evaluate_on_val()
-        print(f"Baseline val_loss: {baseline_val:.6g} mae: {baseline_mae:.6g}")
-
-        # snapshot state before proposing
-        snap = snapshot_permutation_state()
-
-        # propose a small permutation change (gradient step or other)
-        print("Proposing permutation update...")
-        simple_propose_gradient_step(step_size=1.0)
-
-        # adaptation: let the model adapt to the proposed permutation (perms now fixed during adaptation)
-        print(f"Adaptation ({adaptation_epochs} epochs)...")
-        run_epochs(adaptation_epochs, apply_model_updates=True, apply_perm_updates=False, start_epoch=epoch_global)
-        epoch_global += adaptation_epochs
-
-        new_val, new_mae = evaluate_on_val()
-        print(f"Post-adapt val_loss: {new_val:.6g} mae: {new_mae:.6g}")
-
-        rel_imp = (baseline_val - new_val) / max(1e-12, baseline_val)
-        print(f"Relative improvement: {rel_imp:.6%}")
-
-        accepted = False
-        if rel_imp >= accept_rel_improve:
-            # stability quick check
-            print("Tentatively accepted. Running stability window...")
-            run_epochs(patience_epochs, apply_model_updates=True, apply_perm_updates=False, start_epoch=epoch_global)
-            epoch_global += patience_epochs
-            val_after = evaluate_on_val()[0]
-            if val_after <= new_val * 1.001:
-                accepted = True
-                print("Permutation accepted.")
-                # save accepted permutation and model weights
-                np.save(os.path.join(save_dir, f"perms_accepted_cycle_{cycle}.npy"), {
-                    "p1": model.permute1.logits.numpy(),
-                    "p2": model.permute2.logits.numpy(),
-                    "p3": model.permute3.logits.numpy(),
-                    "p4": model.permute4.logits.numpy()
-                })
-                model.save_weights(os.path.join(save_dir, f"model_after_cycle_{cycle}.weights.h5"))
-            else:
-                print("Stability check failed. Reverting.")
-        else:
-            print("Rejected: insufficient improvement.")
-
-        if not accepted:
-            revert_permutation_state(snap)
-            # Optionally reinitialize optimizer state if a clean slate is required:
-            # reinit_optimizers_and_slots()
-
-        # optional: run temperature-controller update after accepted permutation
-        if accepted:
-            # we must supply epoch-aggregated stats from the last adaptation epoch for a correct update;
-            # for brevity, compute a fresh evaluation as input (controller uses epoch metrics)
-            val_loss_now, _ = evaluate_on_val()
-            # compute dummy entropies for controller update (use current perms)
-            ent_summ = {}
-            for name in ["p1","p2","p3","p4"]:
-                Pcur = getattr(model, f"permute{name[-1]}")._sinkhorn(getattr(model, f"permute{name[-1]}").logits / temperatures[name])
-                ent_summ[name] = float(safe_entropy(Pcur, 1e-8).numpy())
-            epoch_controller_update(epoch_global, val_loss_now, ent_summ, steps_in_epoch=1, apply_perm_updates=False)
-
-        # update best_val_loss
-        if new_val < best_val_loss:
-            best_val_loss = new_val
-            print("New best validation loss:", best_val_loss)
-
-        print(f"End of cycle {cycle}; epoch_global={epoch_global}")
-
-    print("Permutation search complete.")
 
 # Run the search loop instead of the previous while loop
 permutation_search_cycle(total_cycles=10_000,
@@ -1046,4 +1090,3 @@ with open("training_history.json", "w") as fh:
     json.dump(history, fh)
 
 print("Training finished. History saved to training_history.json")
-
