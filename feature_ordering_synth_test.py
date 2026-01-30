@@ -13,6 +13,8 @@ import tensorflow as tf
 import matplotlib.pyplot as plt
 import random
 from typing import List
+import time
+
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
@@ -25,9 +27,11 @@ except Exception:
     SCIPY_AVAILABLE = False
     print("scipy not available — using greedy discrete assignment fallback.")
 
-def diagnostic_perm_stats(perms, perm_vars, perm_loss):
-    # perms: list of perm layers [model.permute1,...]
-    # perm_vars: list of trainable var Tensors corresponding to perm logits in same order
+# ----------------------------
+# Utilities / diagnostics
+# ----------------------------
+
+def diagnostic_perm_stats(perms, perm_vars):
     stats = {}
     F = perms[0].num_features
     uniform_entropy = float(np.log(F))
@@ -36,36 +40,33 @@ def diagnostic_perm_stats(perms, perm_vars, perm_loss):
     stats['ent_per_branch'] = ent_np
     stats['ent_mean'] = float(np.mean(ent_np))
     stats['uniform_entropy'] = uniform_entropy
-    # logits norms
     logits_np = [v.numpy() for v in perm_vars]
     stats['logits_norm'] = [float(np.linalg.norm(l)) for l in logits_np]
     stats['logits_mean_abs'] = [float(np.mean(np.abs(l))) for l in logits_np]
-    # KL to uniform per row averaged
     kl_rows = []
     for P in P_np:
         q = np.ones_like(P) / F
         kl = np.mean(np.sum(P * (np.log(np.clip(P,1e-12,1.0)) - np.log(q)), axis=-1))
         kl_rows.append(float(kl))
     stats['kl_uniform'] = kl_rows
-    print("DIAG: ent_mean {:.6f} (uniform {:.6f}); logits_norms {}; logits_mean_abs {}; KL_uniform {}"
-          .format(stats['ent_mean'], uniform_entropy, stats['logits_norm'], stats['logits_mean_abs'], stats['kl_uniform']))
     return stats
- 
 
 # ----------------------------
-# Recreate layers from experiment
+# Permutation layer: Gumbel-Sinkhorn + straight-through optional
 # ----------------------------
 @tf.keras.utils.register_keras_serializable(package="Custom")
 class LearnableFeaturePermute(tf.keras.layers.Layer):
-    def __init__(self, num_features, num_iters=20, temperature=1.0, name=None):
+    def __init__(self, num_features, num_iters=20, temperature=1.0, name=None, use_gumbel=True, straight_through=True):
         super().__init__(name=name)
         self.num_features = int(num_features)
         self.num_iters = int(num_iters)
         self.temperature = tf.Variable(float(temperature), trainable=False, dtype=tf.float32)
-        # logits (F, F)
-        init = tf.random.normal([self.num_features, self.num_features], stddev=0.01)
+        self.use_gumbel = use_gumbel
+        self.straight_through = straight_through
+
+        # initialize logits near zero for near-uniform start
         self.logits = self.add_weight(shape=(self.num_features, self.num_features),
-                                      initializer=tf.constant_initializer(init.numpy()),
+                                      initializer=tf.zeros_initializer(),
                                       trainable=True, name=(name or "perm") + "_logits")
 
     def _sinkhorn(self, log_alpha):
@@ -75,17 +76,63 @@ class LearnableFeaturePermute(tf.keras.layers.Layer):
             logP = logP - tf.reduce_logsumexp(logP, axis=0, keepdims=True)
         return tf.exp(logP)
 
-    def call(self, x):
+    def _sample_gumbel(self, shape, eps=1e-20):
+        u = tf.random.uniform(shape, minval=0.0, maxval=1.0)
+        return -tf.math.log(-tf.math.log(u + eps) + eps)
+
+    def soft_P(self, add_gumbel=False):
+        logits = self.logits / self.temperature
+        if self.use_gumbel and add_gumbel:
+            g = self._sample_gumbel(tf.shape(logits))
+            logits = logits + g
+        return self._sinkhorn(logits)
+
+    def call(self, x, training=False, hard=False):
         # x: (B, T, F)
-        P = self._sinkhorn(self.logits / self.temperature)
+        if self.use_gumbel and training:
+            P_soft = self.soft_P(add_gumbel=True)
+        else:
+            P_soft = self.soft_P(add_gumbel=False)
+
+        if self.straight_through and hard:
+            # discrete forward: project to permutation with Hungarian on numpy
+            P_np = P_soft.numpy()
+            try:
+                if SCIPY_AVAILABLE:
+                    r, c = linear_sum_assignment(-P_np)
+                    P_hard = np.zeros_like(P_np)
+                    P_hard[r, c] = 1.0
+                else:
+                    # greedy fallback
+                    F = P_np.shape[0]
+                    P_hard = np.zeros_like(P_np)
+                    assigned = set()
+                    for r in range(F):
+                        masked = P_np[r].copy()
+                        for a in assigned:
+                            masked[a] = -1e9
+                        c = int(np.argmax(masked))
+                        P_hard[r, c] = 1.0
+                        assigned.add(c)
+            except Exception:
+                # safe fallback
+                P_hard = np.eye(self.num_features, dtype=np.float32)
+            P_hard_tf = tf.convert_to_tensor(P_hard, dtype=tf.float32)
+            P = tf.stop_gradient(P_hard_tf - P_soft) + P_soft
+        else:
+            P = P_soft
+
         flat = tf.reshape(x, [-1, tf.shape(x)[-1]])  # (B*T, F)
         out = tf.matmul(flat, P)                     # (B*T, F)
         out_shape = tf.concat([tf.shape(x)[:-1], tf.constant([self.num_features], dtype=tf.int32)], axis=0)
         return tf.reshape(out, out_shape)
 
-    def soft_P(self):
-        return self._sinkhorn(self.logits / self.temperature)
+    def set_temperature(self, t):
+        self.temperature.assign(float(t))
 
+# ----------------------------
+# Other model components (unchanged structure, slightly simplified build)
+# ----------------------------
 @tf.keras.utils.register_keras_serializable(package="Custom")
 class LearnableQueryPooling(tf.keras.layers.Layer):
     def __init__(self, dim):
@@ -149,12 +196,13 @@ class AdvancedGatedReadout(tf.keras.layers.Layer):
         return out
 
 class TimeSeriesModel(tf.keras.Model):
-    def __init__(self, num_features, dims, norm_layer):
+    def __init__(self, num_features, dims, norm_layer, perm_kwargs=None):
         super().__init__()
-        self.permute1 = LearnableFeaturePermute(num_features, name="perm1")
-        self.permute2 = LearnableFeaturePermute(num_features, name="perm2")
-        self.permute3 = LearnableFeaturePermute(num_features, name="perm3")
-        self.permute4 = LearnableFeaturePermute(num_features, name="perm4")
+        perm_kwargs = perm_kwargs or {}
+        self.permute1 = LearnableFeaturePermute(num_features, name="perm1", **perm_kwargs)
+        self.permute2 = LearnableFeaturePermute(num_features, name="perm2", **perm_kwargs)
+        self.permute3 = LearnableFeaturePermute(num_features, name="perm3", **perm_kwargs)
+        self.permute4 = LearnableFeaturePermute(num_features, name="perm4", **perm_kwargs)
 
         self.agr = AdvancedGatedReadout(dims)
 
@@ -175,19 +223,19 @@ class TimeSeriesModel(tf.keras.Model):
         self.drop3 = tf.keras.layers.Dropout(0.1)
         self.drop4 = tf.keras.layers.Dropout(0.1)
 
-    def call(self, x, training=False):
+    def call(self, x, training=False, hard_perm=False):
         x = self.norm(x)
-        x1 = self.gru1(self.permute1(x))
+        x1 = self.gru1(self.permute1(x, training=training, hard=hard_perm))
         x1 = self.drop1(x1, training=training)
 
-        x2 = self.lstm(self.permute2(x))
+        x2 = self.lstm(self.permute2(x, training=training, hard=hard_perm))
         x2 = self.drop2(x2, training=training)
 
-        x3 = self.conv1(self.permute3(x))
+        x3 = self.conv1(self.permute3(x, training=training, hard=hard_perm))
         x3 = self.act1(x3)
         x3 = self.drop3(x3, training=training)
 
-        x4 = self.t_dense(self.permute4(x))
+        x4 = self.t_dense(self.permute4(x, training=training, hard=hard_perm))
         x4 = self.drop4(x4, training=training)
 
         comb = [x1, x2, x3, x4]
@@ -227,12 +275,14 @@ class TimeSeriesModel(tf.keras.Model):
 # ----------------------------
 # Synthetic data (matching multi-branch identifiability)
 # ----------------------------
+
 def make_sinusoid_basis(T, F):
     t = np.arange(T) / float(T)
     freqs = np.linspace(1.0, 4.0, F)
     phases = np.linspace(0.0, np.pi/2.0, F)
     S = np.stack([np.sin(2 * np.pi * f * t + p) for f, p in zip(freqs, phases)], axis=-1)
     return S.astype(np.float32)
+
 
 def generate_multi_branch_data(N_samples=3000, WL=16, F=8, noise_std=0.01):
     T_total = N_samples + WL + 50
@@ -245,14 +295,10 @@ def generate_multi_branch_data(N_samples=3000, WL=16, F=8, noise_std=0.01):
     X = np.stack(X, axis=0)  # (N, WL, F)
 
     rng = np.random.default_rng(SEED)
-    # global scramble Q: canonical_col -> observed_col
     Q = rng.permutation(F)
-    # branch canonical mappings C_j: permutation arrays of canonical columns
     branch_C = [rng.permutation(F) for _ in range(4)]
-    # branch weights (per-canonical position)
     branch_weights = [np.linspace(1.0, 0.2, F) * (0.5 + 0.5 * rng.random()) for _ in range(4)]
 
-    # Build target: each branch contributes from canonical last-step with its C_j mapping
     last = X[:, -1, :]  # (N, F) canonical
     y = np.zeros(len(last), dtype=np.float32)
     for j in range(4):
@@ -260,37 +306,28 @@ def generate_multi_branch_data(N_samples=3000, WL=16, F=8, noise_std=0.01):
         y += contrib
     y += noise_std * np.random.randn(len(y)).astype(np.float32)
 
-    # Observed inputs scrambled by Q
     X_obs = X[..., Q]  # (N, WL, F) observed col order
 
-    # compute ground-truth mapping for each branch as row->col mapping (observed_row -> canonical_col)
-    # We want P_true such that P_true[observed_row] = canonical_col index (same format as Hungarian output).
-    # If Q maps canonical_col -> observed_col, then for canonical position r, observed_col = Q[C_j[r]]
-    # So row r (observed index) corresponds to some canonical col — invert mapping as earlier.
     P_trues = []
     for j in range(4):
-        # For canonical row idx r (0..F-1), observed_col = Q[ C_j[r] ]
-        # We want array true_perm where true_perm[observed_row] = canonical_row
-        observed_cols_for_rows = Q[branch_C[j]]  # observed_col per canonical row index
-        # Build inverse mapping: for each observed_col, which canonical row does it belong to?
+        observed_cols_for_rows = Q[branch_C[j]]
         inv = np.empty(F, dtype=int)
         for canonical_row, observed_col in enumerate(observed_cols_for_rows):
             inv[observed_col] = canonical_row
-        P_trues.append(inv)  # inv maps observed_col -> canonical_row (row->col mapping format)
+        P_trues.append(inv)
     return X_obs.astype(np.float32), y.astype(np.float32), Q, branch_C, P_trues, branch_weights
 
 # ----------------------------
 # Utilities: discrete extraction + kendall tau
 # ----------------------------
+
 def extract_discrete_from_soft(P: np.ndarray) -> np.ndarray:
-    # P shape (F, F), rows = observed cols, cols = canonical rows
     if SCIPY_AVAILABLE:
         r, c = linear_sum_assignment(-P)  # maximize P
         pred = np.zeros(P.shape[0], dtype=int)
         pred[r] = c
         return pred
     else:
-        # greedy row-wise with conflict resolution
         Pcopy = P.copy()
         F = P.shape[0]
         pred = -np.ones(F, dtype=int)
@@ -304,8 +341,8 @@ def extract_discrete_from_soft(P: np.ndarray) -> np.ndarray:
             assigned.add(c)
         return pred
 
+
 def kendall_tau_perm(true_perm: np.ndarray, pred_perm: np.ndarray) -> float:
-    # Both are arrays: observed_col -> canonical_row
     F = len(true_perm)
     pos_true = np.empty(F, dtype=int)
     pos_pred = np.empty(F, dtype=int)
@@ -329,26 +366,25 @@ def kendall_tau_perm(true_perm: np.ndarray, pred_perm: np.ndarray) -> float:
     return float((concordant - discordant) / total)
 
 # ----------------------------
-# Train/evaluate using TimeSeriesModel with separate optimizers
+# Training / experiment runner
 # ----------------------------
-def run_test(N=3000, WL=16, F=8, epochs=200, batch_size=128,
-             lr_model=1e-3, lr_perm=1e-3, lambda_entropy=0.08, gamma_repel=0.03,
-             hidden_dim=16, verbose=True):
+
+def run_test(N=2000, WL=8, F=8, epochs=200, batch_size=256,
+             lr_model=1e-3, lr_perm=1e-4, lambda_entropy=0.6, gamma_repel=0.03,
+             hidden_dim=8, verbose=True):
+
     X, y, Q, branch_C, P_trues, branch_weights = generate_multi_branch_data(N_samples=N, WL=WL, F=F)
     split = int(0.8 * N)
     X_train, X_val = X[:split], X[split:]
     y_train, y_val = y[:split], y[split:]
 
-    # normalization layer adapted on training set
     norm = tf.keras.layers.Normalization()
-    # flatten over windows/time axis for adapt
     norm.adapt(X_train)
 
-    model = TimeSeriesModel(num_features=F, dims=hidden_dim, norm_layer=norm)
-    # Build model to initialize weights
+    perm_kwargs = dict(use_gumbel=True, straight_through=True, num_iters=20, temperature=1.0)
+    model = TimeSeriesModel(num_features=F, dims=hidden_dim, norm_layer=norm, perm_kwargs=perm_kwargs)
     _ = model(tf.zeros([1, WL, F], dtype=tf.float32))
 
-    # Separate var lists
     perm_vars = model.perm_vars
     model_vars = model.model_vars
 
@@ -359,77 +395,75 @@ def run_test(N=3000, WL=16, F=8, epochs=200, batch_size=128,
     train_ds = tf.data.Dataset.from_tensor_slices((X_train, y_train)).shuffle(2000, seed=SEED).batch(batch_size)
     val_ds = tf.data.Dataset.from_tensor_slices((X_val, y_val)).batch(batch_size)
 
-    history = {'train_loss': [], 'val_loss': [], 'ent': [], 'repulsion': []}
+    history = {'train_loss': [], 'val_loss': [], 'mean_row_max': [], 'ent': [], 'repulsion': []}
 
-    # scale entropy contribution for the model update so model focuses on MSE
-    ENT_MODEL_SCALE = 0.1   # small factor; tune 0.01..0.5 if needed    
+    ENT_MODEL_SCALE = 0.05
+    start_temp = 1.0
+    end_temp = 0.02
 
-    for ep in range(1, epochs+1):
+    def temp_for_epoch(ep, max_ep):
+        return start_temp * ((end_temp / start_temp) ** (ep / float(max_ep)))
+
+    patience = 20
+    min_delta = 1e-5
+    wait = 0
+    best_val = float('inf')
+    best_weights = None
+    best_epoch = 0
+    restore_best_at_end = True    
+
+    for ep in range(1, epochs + 1):
+        t0 = time.time()
         ep_loss = 0.0
         steps = 0
+
+        # anneal temperature at epoch start
+        t = temp_for_epoch(ep, epochs)
+        for p in [model.permute1, model.permute2, model.permute3, model.permute4]:
+            p.set_temperature(t)
+
+        # training
         for xb, yb in train_ds:
             with tf.GradientTape(persistent=True) as tape:
-                preds = model(xb, training=True)[:, 0]
+                preds = model(xb, training=True, hard_perm=False)[:, 0]
                 loss_mse = mse(yb, preds)
-                # compute soft P's and stats
+
                 Ps = [p.soft_P() for p in [model.permute1, model.permute2, model.permute3, model.permute4]]
                 P_stack = tf.stack(Ps, axis=0)  # (4, F, F)
                 P_clamped = tf.clip_by_value(P_stack, 1e-9, 1.0)
-                row_ent = -tf.reduce_mean(tf.reduce_sum(P_clamped * tf.math.log(P_clamped + 1e-12), axis=-1), axis=1)  # (4,)
+
+                # mean per-row max (sharpness)
+                row_max = tf.reduce_mean(tf.reduce_max(P_clamped, axis=-1), axis=1)  # (4,)
+                mean_row_max = tf.reduce_mean(row_max)
+
+                # entropy for diagnostics
+                row_ent = -tf.reduce_mean(tf.reduce_sum(P_clamped * tf.math.log(P_clamped + 1e-12), axis=-1), axis=1)
                 mean_ent = tf.reduce_mean(row_ent)
-                # pairwise L1 repulsion sum
+
+                # pairwise L1 repulsion
                 rep_sum = tf.constant(0.0, dtype=tf.float32)
                 for i in range(4):
-                    for j in range(i+1, 4):
+                    for j in range(i + 1, 4):
                         rep_sum += tf.reduce_mean(tf.abs(P_stack[i] - P_stack[j]))
-                        
-                # compute F for normalization (works whether F is Python int or tf.Tensor)
-                F = tf.cast(tf.shape(P_stack)[1], tf.float32)   # number of features
-                rep_norm = rep_sum / (F * F + 1e-12)            # normalized repulsion in ~O(1) range
-                
-                # separated losses
-                total_loss = loss_mse + (ENT_MODEL_SCALE * lambda_entropy) * mean_ent
-                perm_loss  = (lambda_entropy * mean_ent) - (gamma_repel * rep_norm)                
-            
-            # compute grads separately and apply with respective optimizers
-            grads_model = tape.gradient(total_loss, model_vars)
-            grads_perm  = tape.gradient(perm_loss, perm_vars)
+                Ff = tf.cast(tf.shape(P_stack)[1], tf.float32)
+                rep_norm = rep_sum / (Ff * Ff + 1e-12)
 
-            # ---------------------------------------------------------------- #
-            # --- Running a few extra diagnostics for more in depth checks --- #
-            # ---------------------------------------------------------------- #
-            grad_norms = [float(tf.norm(g).numpy()) if g is not None else 0.0 for g in grads_perm]
-            print("DIAG: perm grad norms:", grad_norms)
-            # Also print sign of dot product between logits and grads to see if optimizer drives logits toward zero
-            dot_products = []
-            for v, g in zip(perm_vars, grads_perm):
-                if g is None:
-                    dot_products.append(None)
-                else:
-                    dp = float(tf.reduce_sum(tf.stop_gradient(v) * g).numpy())
-                    dot_products.append(dp)
-            print("DIAG: logits·grad (negative -> grad reduces logits norm):", dot_products)
-            
-            diagnostic_perm_stats([model.permute1,model.permute2,model.permute3,model.permute4],
-                                  [model.permute1.logits,model.permute2.logits,model.permute3.logits,model.permute4.logits],
-                                  perm_loss)            
-            # ---------------------------------------------------------------- #
-            # --------------------- End of Diagnostics ----------------------- #
-            # ---------------------------------------------------------------- #
-            
-            # safe-guard None grads
+                total_loss = loss_mse + (ENT_MODEL_SCALE * lambda_entropy) * (1.0 - mean_row_max)
+                perm_loss = (lambda_entropy * (1.0 - mean_row_max)) - (gamma_repel * rep_norm)
+
+            grads_model = tape.gradient(total_loss, model_vars)
+            grads_perm = tape.gradient(perm_loss, perm_vars)
+            del tape
+
             grads_model = [(g if g is not None else tf.zeros_like(v)) for g, v in zip(grads_model, model_vars)]
-            grads_perm  = [(g if g is not None else tf.zeros_like(v)) for g, v in zip(grads_perm, perm_vars)]
-            
-            # optional clipping (keep existing clip values you used before)
+            grads_perm = [(g if g is not None else tf.zeros_like(v)) for g, v in zip(grads_perm, perm_vars)]
+
             grads_model = [tf.clip_by_norm(g, 5.0) for g in grads_model]
-            grads_perm  = [tf.clip_by_norm(g, 2.0) for g in grads_perm]
-            
-            # apply gradients with the *separate* optimizers (unchanged from your setup)
+            grads_perm = [tf.clip_by_norm(g, 2.0) for g in grads_perm]
+
             opt_model.apply_gradients(zip(grads_model, model_vars))
             opt_perm.apply_gradients(zip(grads_perm, perm_vars))
 
-            del tape
             ep_loss += float(total_loss.numpy())
             steps += 1
 
@@ -439,26 +473,45 @@ def run_test(N=3000, WL=16, F=8, epochs=200, batch_size=128,
         val_loss = 0.0
         vsteps = 0
         for xv, yv in val_ds:
-            vp = model(xv, training=False)[:, 0]
+            vp = model(xv, training=False, hard_perm=False)[:, 0]
             val_loss += float(mse(yv, vp).numpy())
             vsteps += 1
         val_loss = val_loss / max(1, vsteps)
 
-        # logging stats
+        # logging stats (compute perms for diagnostics)
         Ps_np = [p.soft_P().numpy() for p in [model.permute1, model.permute2, model.permute3, model.permute4]]
         row_ent_np = -np.mean(np.sum(np.clip(Ps_np, 1e-12, 1.0) * np.log(np.clip(Ps_np, 1e-12, 1.0)), axis=-1), axis=1)
         rep_np = 0.0
         for i in range(4):
-            for j in range(i+1, 4):
+            for j in range(i + 1, 4):
                 rep_np += float(np.mean(np.abs(Ps_np[i] - Ps_np[j])))
+        row_max_np = np.mean([np.mean(np.max(Ps_np[i], axis=-1)) for i in range(4)])
 
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
+        history['mean_row_max'].append(float(row_max_np))
         history['ent'].append(float(np.mean(row_ent_np)))
         history['repulsion'].append(float(rep_np))
 
-        if verbose: # and (ep <= 5 or ep % (max(1, epochs // 10)) == 0):
-            print(f"Epoch {ep:03d} | train {train_loss:.6f} val {val_loss:.6f} ent {np.mean(row_ent_np):.5f} rep {rep_np:.5f}")
+        if verbose and (ep <= 10 or ep % max(1, epochs // 10) == 0):
+            elapsed = time.time() - t0
+            print(f"Epoch {ep:03d} | train {train_loss:.6f} val {val_loss:.6f} mean_row_max {row_max_np:.4f} ent {np.mean(row_ent_np):.4f} rep {rep_np:.4f} t={elapsed:.2f}s")
+
+        if val_loss + min_delta < best_val:
+            best_val = val_loss
+            best_weights = model.get_weights()            # captures perms + model weights
+            best_epoch = ep
+            wait = 0
+        else:
+            wait += 1
+
+        if wait >= patience:
+            print(f"Early stopping at epoch {ep} (best epoch {best_epoch}, val {best_val:.6f})")
+            break
+
+    if restore_best_at_end and best_weights is not None:
+        model.set_weights(best_weights)
+        print(f"Restored best weights from epoch {best_epoch} with val {best_val:.6f}")        
 
     # final discrete extraction and metrics
     P_final = [p.soft_P().numpy() for p in [model.permute1, model.permute2, model.permute3, model.permute4]]
@@ -466,7 +519,7 @@ def run_test(N=3000, WL=16, F=8, epochs=200, batch_size=128,
     accuracies = []
     taus = []
     for j in range(4):
-        true = P_trues[j]   # observed_col -> canonical_row
+        true = P_trues[j]
         pred = preds[j]
         acc = float((pred == true).mean())
         tau = kendall_tau_perm(true, pred)
@@ -482,12 +535,11 @@ def run_test(N=3000, WL=16, F=8, epochs=200, batch_size=128,
     plt.plot(history['train_loss'], label='train'); plt.plot(history['val_loss'], label='val')
     plt.yscale('log'); plt.legend(); plt.title('Loss')
     plt.subplot(1,3,2)
-    plt.plot(history['ent']); plt.title('mean row entropy')
+    plt.plot(history['mean_row_max']); plt.title('mean row max (sharpness)')
     plt.subplot(1,3,3)
     plt.plot(history['repulsion']); plt.title('repulsion (sum pairwise L1)')
     plt.tight_layout(); plt.show()
 
-    # show final P matrices
     fig, axs = plt.subplots(1, 4, figsize=(12,3))
     for i in range(4):
         axs[i].imshow(P_final[i], aspect='auto', cmap='viridis')
@@ -506,7 +558,10 @@ def run_test(N=3000, WL=16, F=8, epochs=200, batch_size=128,
         'branch_weights': branch_weights
     }
 
+
 if __name__ == "__main__":
     out = run_test(N=10000, WL=8, F=8, epochs=10000, batch_size=256,
-                   lr_model=1e-3, lr_perm=1e-3, lambda_entropy=0.08, gamma_repel=0.03,
-                   hidden_dim=4, verbose=True)
+                   lr_model=1e-3, lr_perm=1e-3, lambda_entropy=0.6, gamma_repel=0.03,
+                   hidden_dim=8, verbose=True)
+
+    print('\nExperiment finished — returned dictionary `out`.')
