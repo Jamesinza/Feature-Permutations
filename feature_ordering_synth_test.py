@@ -334,6 +334,9 @@ def run_test(N=3000, WL=16, F=8, epochs=200, batch_size=128,
 
     history = {'train_loss': [], 'val_loss': [], 'ent': [], 'repulsion': []}
 
+    # scale entropy contribution for the model update so model focuses on MSE
+    ENT_MODEL_SCALE = 0.1   # small factor; tune 0.01..0.5 if needed    
+
     for ep in range(1, epochs+1):
         ep_loss = 0.0
         steps = 0
@@ -353,20 +356,27 @@ def run_test(N=3000, WL=16, F=8, epochs=200, batch_size=128,
                     for j in range(i+1, 4):
                         rep_sum += tf.reduce_mean(tf.abs(P_stack[i] - P_stack[j]))
                         
-                total_loss = loss_mse + lambda_entropy * mean_ent - gamma_repel * rep_sum
-
-            # grads
+                # compute F for normalization (works whether F is Python int or tf.Tensor)
+                F = tf.cast(tf.shape(P_stack)[1], tf.float32)   # number of features
+                rep_norm = rep_sum / (F * F + 1e-12)            # normalized repulsion in ~O(1) range
+                
+                # separated losses
+                total_loss = loss_mse + (ENT_MODEL_SCALE * lambda_entropy) * mean_ent
+                perm_loss  = (lambda_entropy * mean_ent) - (gamma_repel * rep_norm)                
+            
+            # compute grads separately and apply with respective optimizers
             grads_model = tape.gradient(total_loss, model_vars)
-            grads_perm = tape.gradient(total_loss, perm_vars)
-
-            # replace None with zeros
+            grads_perm  = tape.gradient(perm_loss, perm_vars)
+            
+            # safe-guard None grads
             grads_model = [(g if g is not None else tf.zeros_like(v)) for g, v in zip(grads_model, model_vars)]
-            grads_perm = [(g if g is not None else tf.zeros_like(v)) for g, v in zip(grads_perm, perm_vars)]
-
-            # optional clipping
+            grads_perm  = [(g if g is not None else tf.zeros_like(v)) for g, v in zip(grads_perm, perm_vars)]
+            
+            # optional clipping (keep existing clip values you used before)
             grads_model = [tf.clip_by_norm(g, 5.0) for g in grads_model]
-            grads_perm = [tf.clip_by_norm(g, 2.0) for g in grads_perm]
-
+            grads_perm  = [tf.clip_by_norm(g, 2.0) for g in grads_perm]
+            
+            # apply gradients with the *separate* optimizers (unchanged from your setup)
             opt_model.apply_gradients(zip(grads_model, model_vars))
             opt_perm.apply_gradients(zip(grads_perm, perm_vars))
 
@@ -448,6 +458,6 @@ def run_test(N=3000, WL=16, F=8, epochs=200, batch_size=128,
     }
 
 if __name__ == "__main__":
-    out = run_test(N=10000, WL=8, F=8, epochs=200, batch_size=256,
-                   lr_model=1e-3, lr_perm=1e-2, lambda_entropy=0.08, gamma_repel=0.03,
+    out = run_test(N=10000, WL=8, F=8, epochs=10000, batch_size=256,
+                   lr_model=1e-3, lr_perm=1e-3, lambda_entropy=0.08, gamma_repel=0.03,
                    hidden_dim=4, verbose=True)
